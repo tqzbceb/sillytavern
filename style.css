@@ -1,0 +1,177 @@
+/* 弹窗顺手 + 密钥小眼睛 (Popup Polish)
+   —— 只作用于加了 tpp-* class 的弹窗和密钥框，不碰颜色 / 字体 / 圆角 */
+
+/* ---------------------------------------------------------- 弹窗位移 */
+
+/* 输入法避让 / 手指拖动都只改这一个变量，位移永远是纯 transform（不触发重排） */
+.popup.tpp-popup {
+    transform: translateY(var(--tpp-shift, 0px));
+    transition: transform 0.18s cubic-bezier(0.22, 0.68, 0, 1);
+}
+
+/* 手指按着的时候必须跟手，不能有过渡 */
+.popup.tpp-popup.tpp-dragging {
+    transition: none;
+    will-change: transform;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .popup.tpp-popup {
+        transition: none;
+    }
+}
+
+/* 输入法弹出会让 100dvh 变小 → 原生 max-height 跟着缩，弹窗当场变形抖动。
+   装配时把当时的视口高度记进 --tpp-vh，把高度钉住。 */
+.popup.tpp-popup.tpp-freeze {
+    max-height: calc(var(--tpp-vh, 100dvh) - 2em);
+}
+
+.popup.tpp-popup.tpp-freeze .popup-body {
+    max-height: calc(var(--tpp-vh, 100dvh) * 0.95);
+}
+
+/* ---------------------------------------------------- 输入类弹窗外观 */
+
+/* 原生固定 500px。窄屏时贴到 100dvw-12px（原生留了 2em，看着窄一截） */
+.popup.tpp-popup.tpp-wide {
+    /* 原生是 content-box，写 100dvw-12px 时实际比屏幕还宽（padding 另算）*/
+    box-sizing: border-box;
+    width: min(var(--tpp-width, 640px), calc(100dvw - 12px));
+    max-width: calc(100dvw - 12px);
+}
+
+/* 手机上「变宽」的空间几乎全在边距里：原生弹窗左右各留 2em(≈30px) 空白 +
+   自己 14px padding + popup-content 8px，一个 380px 的屏幕输入框只剩 ≈320px。
+   窄屏下把这三层边距收一收，输入框能实打实宽出 30~40px。 */
+@media screen and (max-width: 600px) {
+    .popup.tpp-popup.tpp-wide {
+        width: min(var(--tpp-width, 640px), calc(100dvw - 10px));
+        max-width: calc(100dvw - 10px);
+        padding: 4px 8px;
+    }
+
+    .popup.tpp-popup.tpp-wide .popup-content {
+        padding: 0 4px;
+    }
+
+    /* 关闭按钮原生挂在弹窗右上角外面 -6px，边距收窄后容易贴出屏幕 */
+    .popup.tpp-popup.tpp-wide .popup-button-close {
+        top: -4px;
+        right: -2px;
+    }
+}
+
+/* 原生 rows=1 的 textarea 只有一行文字高，看着很扁 */
+.popup.tpp-popup.tpp-roomy .popup-input {
+    height: auto;
+    min-height: var(--tpp-input-height, 42px);
+    padding: 8px 10px;
+    line-height: 1.45;
+    box-sizing: border-box;
+}
+
+/* 名字超长时不换行，继续往右延伸（textarea 需要 wrap="off" + white-space: pre 双管） */
+.popup.tpp-popup .popup-input.tpp-oneline {
+    white-space: pre;
+    overflow-x: auto;
+    overflow-y: hidden;
+    overflow-wrap: normal;
+    word-break: normal;
+    resize: none;
+    text-overflow: clip;
+    /* 横向滚动条会从这一行的高度里吃掉 10px，让文字被挤扁；藏掉，
+       光标移动照样会把内容滚过去 */
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+}
+
+.popup.tpp-popup .popup-input.tpp-oneline::-webkit-scrollbar {
+    display: none;
+}
+
+/* ------------------------------------------------------------ 动画 */
+
+/* 原生是 scaleY(0) → scaleY(1)：整窗竖向拉伸，文字每帧重新排版重新光栅化，
+   手机上就是那股「顿挫感」。换成位移 + 淡入，合成器一条路走完。 */
+@keyframes tpp-pop-in {
+    from {
+        opacity: 0;
+        transform: translateY(calc(var(--tpp-shift, 0px) + 12px));
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(var(--tpp-shift, 0px));
+    }
+}
+
+@keyframes tpp-pop-out {
+    from {
+        opacity: 1;
+        transform: translateY(var(--tpp-shift, 0px));
+    }
+
+    to {
+        opacity: 0;
+        transform: translateY(calc(var(--tpp-shift, 0px) + 8px));
+    }
+}
+
+.popup.tpp-popup.tpp-anim[opening] {
+    animation: tpp-pop-in var(--tpp-anim-ms, 150ms) cubic-bezier(0.2, 0.75, 0.3, 1) both;
+    will-change: transform, opacity;
+}
+
+.popup.tpp-popup.tpp-anim[closing] {
+    animation: tpp-pop-out calc(var(--tpp-anim-ms, 150ms) * 0.8) ease-in both;
+}
+
+.popup.tpp-popup.tpp-anim[opening]::backdrop,
+.popup.tpp-popup.tpp-anim[closing]::backdrop {
+    animation-duration: var(--tpp-anim-ms, 150ms);
+}
+
+/* 开窗那一下别做实时高斯模糊 —— 模糊 + 动画同帧是手机掉帧的大头 */
+.popup.tpp-popup.tpp-anim[opening]::backdrop {
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+}
+
+.popup.tpp-popup.tpp-cheap-backdrop[open]::backdrop {
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+}
+
+/* --------------------------------------------------------- 小眼睛 */
+
+.tpp-eye {
+    flex: 0 0 auto;
+    align-self: stretch;
+    min-width: 2.05em;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    padding: 0 0.4em;
+}
+
+/* ------------------------------------------------------- 设置面板 */
+
+#tpp_settings .tpp-setting-row {
+    align-items: center;
+    gap: 8px;
+    margin-top: 4px;
+}
+
+#tpp_settings .tpp-setting-row input[type="number"] {
+    width: 6em;
+    flex: 0 0 auto;
+    margin: 0;
+}
+
+#tpp_settings .tpp-hint {
+    display: block;
+    margin-top: 8px;
+    opacity: 0.7;
+}

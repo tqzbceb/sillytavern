@@ -23,7 +23,8 @@
 
 const MODULE_NAME = 'tavernPopupPolish';
 const LOG = '[popup-polish]';
-const VERSION = '1.3.0';   // 面板标题后面会显示，用来确认装上的到底是哪一版
+const VERSION = '1.4.0';
+const SETTINGS_REV = 2;    // 改过默认值就 +1，用来把旧的默认值迁移掉   // 面板标题后面会显示，用来确认装上的到底是哪一版
 
 const DEFAULT_SETTINGS = {
     enabled: true,
@@ -33,7 +34,7 @@ const DEFAULT_SETTINGS = {
     guardKeyHint: true,     // 不让已存的密钥出现在输入框的提示文字(placeholder)里
 
     /* 弹窗输入框外观 */
-    widePopup: true,        // 输入类弹窗整体更宽
+    widePopup: false,       // 输入类弹窗整体更宽（用户反馈太宽，默认关掉，宽度就是原生的）
     popupWidth: 640,        // 目标宽度(px)，窄屏自动收到 100dvw-12px
     roomyInput: true,       // 输入框更高（原生 rows=1 太扁）
     inputHeight: 42,        // 输入框最小高度(px)
@@ -42,7 +43,9 @@ const DEFAULT_SETTINGS = {
     /* 输入法避让 */
     kbdAvoid: true,         // 输入法遮住输入框时把弹窗往上推
     kbdWholePopup: true,    // 一次把弹窗底部（含「取消 / 确认」那一排）都顶到输入法上方
-    liftMax: false,         // 不管输入法多高，一次顶到极限（输入框顶部贴着屏幕顶）—— 输入法高度测不准时用
+    liftMax: false,         // 不管输入法多高，一次顶到极限（输入框顶部贴着屏幕顶）
+    assumeKbd: true,        // 环境完全测不出输入法高度时，按屏幕比例假定一个（TauriTavern 安卓常见）
+    assumeKbdPct: 45,       // 假定输入法占屏幕高度的百分之几
     kbdMargin: 16,          // 弹窗底部与输入法之间留的空(px)。按钮还是被挡住就把它调大（比如 60）
     kbdMinInset: 90,        // 视口底部被吃掉超过这个值才算「输入法开了」(px)
     dragShift: true,        // 可以用手指上下拖动弹窗
@@ -90,10 +93,14 @@ function cfg() {
         return globalThis.__tppFallbackCfg;
     }
     if (!store[MODULE_NAME]) store[MODULE_NAME] = {};
+    const own = store[MODULE_NAME];
     for (const [k, v] of Object.entries(DEFAULT_SETTINGS)) {
-        if (store[MODULE_NAME][k] === undefined) store[MODULE_NAME][k] = v;
+        if (own[k] === undefined) own[k] = v;
     }
-    return store[MODULE_NAME];
+    // 一次性迁移：老设置里存着的旧默认值要跟着改（光改 DEFAULT_SETTINGS 对老用户没用）
+    if (!(own.rev >= 2)) own.widePopup = false;     // rev 1 → 2：弹窗宽度还给原生
+    own.rev = SETTINGS_REV;
+    return own;
 }
 
 function saveCfg() {
@@ -147,6 +154,7 @@ function cssPx(name) {
 /* ------------------------------------------------- 视口 / 输入法高度 */
 
 function isMobileUA() {
+    if (typeof globalThis.__tppMobile === 'boolean') return globalThis.__tppMobile;   // 测试覆盖
     return /Android|iPhone|iPad|iPod|Mobile|Tauri/i.test(navigator.userAgent || '');
 }
 
@@ -164,6 +172,30 @@ function layoutHeight() {
  * 光看 inset 根本看不出输入法开着。所以额外记住历史最大高度当基线。
  */
 let baseLayoutH = 0;
+
+/**
+ * 有些安卓 WebView（用户的 TauriTavern 就是）输入法弹出时**页面一点都察觉不到**：
+ * 布局视口不缩、visualViewport 不缩、原生层也没注入 --tt-ime-bottom。
+ * 这种环境只能：① 试 VirtualKeyboard API 拿键盘矩形；② 拿不到就按屏幕比例假定一个。
+ */
+let kbdBlind = false;        // 已确认这个环境测不出输入法
+let assumedInset = 0;        // 当前按比例假定的输入法高度（0 = 没在假定）
+let vkTried = false;
+
+/** VirtualKeyboard API：只有 overlaysContent = true 时才会给出键盘矩形 */
+function vkInset() {
+    const vk = navigator.virtualKeyboard;
+    if (!vk) return -1;                       // 不支持
+    if (!vkTried) {
+        vkTried = true;
+        try {
+            vk.overlaysContent = true;        // 只在确认测不出输入法之后才会走到这里
+            vk.addEventListener?.('geometrychange', () => schedule());
+        } catch { /* ignore */ }
+    }
+    const r = vk.boundingRect;
+    return r && r.height > 0 ? r.height : 0;
+}
 
 function noteLayoutHeight() {
     const h = layoutHeight();
@@ -196,16 +228,33 @@ function viewport() {
     const ime = cssPx('--tt-ime-bottom');
     if (ime > 0 && seen < 40) bottom = Math.min(bottom, layoutH - ime);
 
+    // 真实信号都没反映出输入法时，才轮到 VirtualKeyboard API 和「按比例假定」
+    let source = seen >= 40 ? 'viewport' : (ime > 0 ? 'ime-var' : 'none');
+    if (layoutH - bottom < 40 && kbdBlind) {
+        const vk = vkInset();
+        if (vk > 40) {
+            bottom = layoutH - vk;
+            source = 'vk-api';
+        } else if (assumedInset > 40) {
+            bottom = layoutH - assumedInset;
+            source = 'assumed';
+        }
+    }
+
     const test = Number(globalThis.__tppKbdInset);
-    if (Number.isFinite(test) && test > 0) bottom = layoutH - test;
+    if (Number.isFinite(test) && test > 0) {
+        bottom = layoutH - test;
+        source = 'test';
+    }
 
     // 兜底：可见区再怎么算也不该只剩一条缝
     if (bottom < 100) bottom = Math.min(layoutH, 100);
 
-    return { top, bottom, layoutH, inset: Math.max(0, layoutH - bottom), imeVar: ime, shrink, vvH: vv?.height || 0 };
+    return { top, bottom, layoutH, inset: Math.max(0, layoutH - bottom), imeVar: ime, shrink, vvH: vv?.height || 0, source };
 }
 
 function keyboardOpen(vp = viewport()) {
+    if (vp.source === 'assumed' || vp.source === 'vk-api') return true;
     if (vp.inset >= cfg().kbdMinInset) return true;
     // adjustResize：视口自己缩了，inset 看不出来 —— 只在手机上启用这一路，
     // 免得桌面用户拖动窗口高度时被误判成输入法。
@@ -403,7 +452,8 @@ function diagText(dlg) {
     return [
         `tpp v${VERSION} hook=${state?.how || lastHook} pops=${popups.size} enh=${dlg?.classList.contains('tpp-popup') ? 1 : 0}`,
         `layoutH=${n(vp.layoutH)} base=${n(baseLayoutH)} vvH=${n(vp.vvH)} ime=${n(vp.imeVar)} shrink=${n(vp.shrink)}`,
-        `visible=${n(vp.top)}..${n(vp.bottom)} inset=${n(vp.inset)} kbd=${keyboardOpen(vp) ? 'YES' : 'no'}`,
+        `visible=${n(vp.top)}..${n(vp.bottom)} inset=${n(vp.inset)} kbd=${keyboardOpen(vp) ? 'YES' : 'no'} src=${vp.source}`,
+        `blind=${kbdBlind ? 1 : 0} assume=${n(assumedInset)} vk=${navigator.virtualKeyboard ? (vkTried ? 'on' : 'idle') : 'none'} mobile=${isMobileUA() ? 1 : 0}`,
         `dlg=${n(r?.top)}..${n(r?.bottom)} input=${n(ir?.top)}..${n(ir?.bottom)} ctrls=${n(ctrls?.top)}..${n(ctrls?.bottom)}`,
         `tag=${dlg?.tagName} css=${getComputedStyle(dlg).getPropertyValue('--tpp-css').trim() || 'NO'} ctrlsInDlg=${dlg?.querySelector('.popup-controls') ? 1 : 0}/doc=${document.querySelectorAll('.popup-controls').length} in1line=${input?.classList.contains('tpp-oneline') ? 1 : 0} inH=${n(ir?.height)}`,
         `need=${n(m?.need)} shift=${n(dlg ? currentShift(dlg) : null)} hardMin=${n(m?.hardMin)} btnVisible=${okBtn}`,
@@ -653,6 +703,9 @@ function enhance(dlg, how = 'unknown') {
     schedule();
     afterOpen(dlg, () => {
         applyInputLook(dlg, state);          // 开窗后输入框才量得到，补一次
+        // 接管得晚（扫描兜底）时 focusin 可能已经过去了，这里补一次判定
+        const active = document.activeElement;
+        if (active && dlg.contains(active) && isEditable(active)) noteFocusIn(active);
         schedule();
     });
 }
@@ -735,14 +788,70 @@ function sweepPopups() {
     }
 }
 
+/** 输入框拿到焦点：先等真实信号，等不到就断定这个环境是「输入法盲区」，按比例假定一个 */
+let assumeTimer = 0;
+
+function noteFocusIn(target) {
+    if (!cfg().enabled || !cfg().kbdAvoid || !cfg().assumeKbd) return;
+    if (!isEditable(target)) return;
+    if (!isMobileUA()) return;                       // 桌面没有软键盘，别乱顶
+    const dlg = target.closest?.('.popup');
+    if (!dlg || !popups.has(dlg)) return;
+
+    const apply = () => {
+        assumeTimer = 0;
+        const raw = viewport();
+        // 真实信号出现了（视口缩了 / 原生层报了高度）→ 什么都不用假定
+        if (raw.inset >= 40 && raw.source !== 'assumed') {
+            kbdBlind = false;
+            assumedInset = 0;
+            schedule();
+            return;
+        }
+        kbdBlind = true;
+        if (vkInset() > 40) {                        // VirtualKeyboard API 能给真高度，最好
+            assumedInset = 0;
+        } else {
+            const pct = clamp(Number(cfg().assumeKbdPct) || 45, 20, 80);
+            assumedInset = Math.round(raw.layoutH * pct / 100);
+        }
+        dbg('keyboard blind -> assume', assumedInset);
+        schedule();
+    };
+
+    clearTimeout(assumeTimer);
+    // 已经确认过是盲区的话立刻假定，第一次给输入法 350ms 让真实信号先说话
+    if (kbdBlind) apply();
+    else assumeTimer = setTimeout(apply, 350);
+}
+
+function noteFocusOut() {
+    clearTimeout(assumeTimer);
+    assumeTimer = 0;
+    setTimeout(() => {
+        const active = document.activeElement;
+        if (isEditable(active) && active.closest?.('.popup')) return;   // 还在别的输入框里
+        if (assumedInset) {
+            assumedInset = 0;                        // 输入框失焦 = 输入法收了（盲区里只能这么判断）
+            schedule();
+        }
+    }, 60);
+}
+
 function bindViewport() {
     const vv = window.visualViewport;
     vv?.addEventListener('resize', schedule);
     vv?.addEventListener('scroll', schedule);
     window.addEventListener('resize', schedule);
     window.addEventListener('orientationchange', schedule);
-    document.addEventListener('focusin', schedule);
-    document.addEventListener('focusout', schedule);
+    document.addEventListener('focusin', (e) => {
+        noteFocusIn(e.target);
+        schedule();
+    });
+    document.addEventListener('focusout', () => {
+        noteFocusOut();
+        schedule();
+    });
     // 测试 / 兜底钩子：有的 WebView 不发 visualViewport 事件
     document.addEventListener('tpp-viewport', schedule);
     setInterval(() => {
@@ -966,12 +1075,13 @@ const TOGGLES = [
     ['enabled', '启用本扩展', 'Enable this extension'],
     ['keyReveal', '密钥框右边加「小眼睛」', 'Add an eye button next to the API key'],
     ['guardKeyHint', '不让已存的密钥出现在提示文字里', 'Keep the stored key out of the placeholder'],
-    ['widePopup', '输入类弹窗更宽', 'Wider input popups'],
+    ['widePopup', '输入类弹窗更宽（默认关，宽度就是原生的）', 'Wider input popups'],
     ['roomyInput', '输入框更高（不那么扁）', 'Taller input field'],
     ['singleLine', '名字超长保持一行往右延伸', 'Keep the name on one line'],
     ['kbdAvoid', '输入法遮住时把弹窗往上推', 'Push the popup up when the keyboard covers it'],
     ['kbdWholePopup', '连「取消 / 确认」一起顶到输入法上方（上面的内容推出屏幕）', 'Also lift the OK/Cancel row above the keyboard'],
-    ['liftMax', '一次顶到最高（输入法高度测不准 / 按钮还被挡住时勾这个）', 'Always lift as far as allowed'],
+    ['liftMax', '一次顶到最高（按钮还被挡住时勾这个）', 'Always lift as far as allowed'],
+    ['assumeKbd', '测不出输入法高度时按屏幕比例假定（安卓 WebView 必需）', 'Assume a keyboard height when it cannot be measured'],
     ['dragShift', '可以用手指上下拖动弹窗', 'Drag the popup up and down'],
     ['dragAlways', '输入法没开时也能拖', 'Allow dragging even without the keyboard'],
     ['dragOverflow', '弹窗比屏幕高时可以拖着看（手机）', 'Drag to peek when the popup is taller than the screen'],
@@ -987,6 +1097,7 @@ const NUMBERS = [
     ['popupWidth', '弹窗目标宽度 (px)', 'Popup width (px)', 360, 1200],
     ['inputHeight', '输入框最小高度 (px)', 'Input height (px)', 24, 96],
     ['kbdMargin', '弹窗底边与输入法的间距 (px)', 'Gap above the keyboard (px)', 0, 80],
+    ['assumeKbdPct', '假定的输入法高度（占屏幕 %）', 'Assumed keyboard height (% of screen)', 20, 80],
     ['animMs', '开窗动画时长 (ms)', 'Animation duration (ms)', 60, 400],
 ];
 
@@ -1086,7 +1197,7 @@ function start() {
 }
 
 globalThis.popupPolish = {
-    VERSION, cfg, diagText, sweepPopups, applyAutoShift, saveCfg, viewport, keyboardOpen, measure, bounds, popups, eyes,
+    VERSION, cfg, kbdState: () => ({ kbdBlind, assumedInset, vk: !!navigator.virtualKeyboard }), diagText, sweepPopups, applyAutoShift, saveCfg, viewport, keyboardOpen, measure, bounds, popups, eyes,
     enhance, ensureEyes, removeEyes, schedule, currentShift, setShift,
 };
 

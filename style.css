@@ -3,16 +3,32 @@
 
 /* ---------------------------------------------------------- 弹窗位移 */
 
-/* 输入法避让 / 手指拖动都只改这一个变量，位移永远是纯 transform（不触发重排） */
+/* 输入法避让 / 手指拖动都只改位移，纯 transform（不触发重排）。
+   实际位移由 JS 写成内联 translate3d()，这里的 var() 只是兜底 + 给 keyframes 用。 */
 .popup.tpp-popup {
     transform: translateY(var(--tpp-shift, 0px));
     transition: transform 0.18s cubic-bezier(0.22, 0.68, 0, 1);
 }
 
-/* 手指按着的时候必须跟手，不能有过渡 */
+/* 手指按着的时候必须跟手：不能有过渡，图层提前提出来，背景也别再实时模糊
+   （每帧重算高斯模糊 = 手机上最贵的一件事，拖动的顿挫感大半来自这里） */
 .popup.tpp-popup.tpp-dragging {
     transition: none;
     will-change: transform;
+}
+
+.popup.tpp-popup.tpp-dragging[open]::backdrop {
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    transition: none;
+}
+
+/* 拖动中不做任何插值动画：弹窗里那些自带 backdrop-filter 的小控件也一并停掉 */
+.popup.tpp-popup.tpp-dragging .popper-modal,
+.popup.tpp-popup.tpp-dragging .drawer-content,
+.popup.tpp-popup.tpp-dragging .list-group {
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
 }
 
 @media (prefers-reduced-motion: reduce) {

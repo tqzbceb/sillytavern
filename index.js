@@ -10,8 +10,10 @@
  *
  * 2) 输入类弹窗（新增 / 改名 API 连接配置、各种「起个名字」弹窗）优化
  *    - 输入框更宽更高，名字超长时**保持一行**往右延伸（原生是 textarea 会换行）
- *    - 输入法弹出遮住名字时，把弹窗往上推（可以推出屏幕顶部）直到名字露出来
- *    - 推上去之后可以用手指把弹窗**拉回来看**，拉的过程不关输入法；推 / 拉都有边界
+ *    - 输入法弹出时把弹窗整体上顶，直到**输入框和「取消 / 确认」那一排一起露在输入法上方**
+ *      （上面的勾选项该顶出屏幕就顶出去），这样不用收输入法就能直接保存
+ *    - 顶上去之后可以用手指把弹窗**拉回来看**上面的内容，拉的过程不关输入法；推 / 拉都有边界
+ *    - 输入法一收（点空白、输入法自带的收起键、返回键都算）弹窗自动回原位
  *    - 点空白处仍然是原生行为（收输入法），输入法一收弹窗自动回位
  *    - 原生开窗动画是 `scaleY(0) → scaleY(1)` + 背景实时高斯模糊，手机上必卡；
  *      换成短促的位移 + 淡入，并且开窗过程中不做模糊
@@ -38,7 +40,8 @@ const DEFAULT_SETTINGS = {
 
     /* 输入法避让 */
     kbdAvoid: true,         // 输入法遮住输入框时把弹窗往上推
-    kbdMargin: 10,          // 输入框底部与输入法之间留的空(px)
+    kbdWholePopup: true,    // 一次把弹窗底部（含「取消 / 确认」那一排）都顶到输入法上方
+    kbdMargin: 10,          // 弹窗底部与输入法之间留的空(px)
     kbdMinInset: 90,        // 视口底部被吃掉超过这个值才算「输入法开了」(px)
     dragShift: true,        // 可以用手指上下拖动弹窗
     dragAlways: false,      // 输入法没开时也允许拖动
@@ -233,6 +236,7 @@ function shiftTarget(dlg) {
 }
 
 function currentShift(dlg) {
+    if (typeof dlg.__tppShift === 'number') return dlg.__tppShift;
     return parseFloat(dlg.style.getPropertyValue('--tpp-shift')) || 0;
 }
 
@@ -254,32 +258,48 @@ function actualShift(dlg) {
     }
 }
 
-function setShift(dlg, px) {
-    dlg.style.setProperty('--tpp-shift', `${Math.round(px)}px`);
+/**
+ * 位移写内联 `transform`，不写自定义属性。
+ * 自定义属性是**会继承**的：改一次 `--tpp-shift`，弹窗里每个子元素的样式都要重算，
+ * 拖动时每帧几十次 → 那就是「拖起来卡卡的」的真凶。transform 不继承，只动合成器。
+ * `--tpp-shift` 只在非拖动时同步一份，给开窗 / 关窗的 keyframes 用。
+ */
+function setShift(dlg, px, { fast = false } = {}) {
+    const v = Math.round(px);
+    dlg.__tppShift = v;
+    dlg.style.transform = `translate3d(0, ${v}px, 0)`;
+    if (!fast) dlg.style.setProperty('--tpp-shift', `${v}px`);
+}
+
+/** 要顶到输入法上方的那条底边：整窗底部（含按钮排），或者只要输入框底部 */
+function avoidBottom(dlg, shift) {
+    if (cfg().kbdWholePopup) return dlg.getBoundingClientRect().bottom - shift;
+    const target = shiftTarget(dlg);
+    if (target) return target.getBoundingClientRect().bottom - shift;
+    return dlg.getBoundingClientRect().bottom - shift;
 }
 
 /**
  * 位移的允许范围（推 / 拉都不许过头）。
- *   min（负 = 往上）：再往上推，输入框顶部就要出屏幕了
- *   max（≥0 = 往下）：手机上弹窗常常比屏幕还高、顶部被截掉一截，
- *                     截掉多少就允许往下拉回多少（拉到能看见标题为止），
- *                     弹窗没被截断时 max = 0，也就是「最多回到原位」
+ *   min（负 = 往上）：一路推到**弹窗底边**（取消 / 确认那一排）落在输入法上方，
+ *                     上面的内容该出屏幕就出屏幕 —— 想看再拉回来。
+ *                     唯一的红线：不能把正在输入的那个框推出屏幕顶部。
+ *   max（≥0 = 往下）：弹窗比屏幕高、顶部本来就被截掉时，截掉多少就允许往下拉回多少；
+ *                     没被截断时 max = 0，也就是「最多回到原位」
  */
 function bounds(dlg) {
     const vp = viewport();
     const shift = actualShift(dlg);
     const dr = dlg.getBoundingClientRect();
     const baseDlgTop = dr.top - shift;
-    const baseDlgBottom = dr.bottom - shift;
+
+    let min = -Math.max(0, avoidBottom(dlg, shift) + cfg().kbdMargin - vp.bottom);
 
     const target = shiftTarget(dlg);
-    let min;
     if (target) {
         const r = target.getBoundingClientRect();
-        min = -Math.max(0, (r.top - shift) - vp.top - 8);
-    } else {
-        // 没有输入框的弹窗：往上最多推到底边贴着可见区底部
-        min = -Math.max(0, baseDlgBottom - vp.bottom);
+        const inputLimit = -Math.max(0, (r.top - shift) - vp.top - 8);
+        min = Math.max(min, inputLimit);              // 两个都是负数，取“推得少”的那个当红线
     }
 
     const clipped = Math.max(0, vp.top - baseDlgTop);
@@ -289,53 +309,61 @@ function bounds(dlg) {
 /**
  * 算这个弹窗现在该往上推多少。
  * shift 为负数表示往上推；自动避让只会在 [min, 0] 里选，永远不会自己往下拉。
+ * `need > 0` = 底边（默认含按钮排）确实被输入法压住了。
  */
 function measure(dlg) {
-    const target = shiftTarget(dlg);
-    if (!target) return null;
-
     const b = bounds(dlg);
-    const rect = target.getBoundingClientRect();
-    const baseBottom = rect.bottom - b.shift;
-    // 需要推多少：输入框底部 + 留白 要落在输入法上沿以上
-    const need = -(baseBottom + cfg().kbdMargin - b.vp.bottom);
+    const need = avoidBottom(dlg, b.shift) + cfg().kbdMargin - b.vp.bottom;
 
-    return { shift: clamp(Math.min(0, need), b.min, 0), min: b.min, max: b.max, need, vp: b.vp };
+    return { shift: clamp(-Math.max(0, need), b.min, 0), min: b.min, max: b.max, need, vp: b.vp };
 }
 
 function applyAutoShift(dlg, { force = false } = {}) {
     const state = popups.get(dlg);
     if (!state || !cfg().kbdAvoid) return;
     if (!dlg.hasAttribute('open') || dlg.hasAttribute('closing')) return;
+    if (state.drag?.active) return;                   // 手指正按着，别跟他抢（也别在拖动中强制重排）
 
     const vp = viewport();
+    const open = keyboardOpen(vp);
+    if (cfg().freezeHeight && !open) freezeHeight(dlg);
 
-    // 输入法收了 → 回位，同时解除「用户手动拖过」的锁定，并重新记一次视口高度
-    if (!keyboardOpen(vp)) {
-        state.kbdWasOpen = false;
-        if (cfg().freezeHeight) freezeHeight(dlg);
-        // 例外：没有输入法的时候用户自己拖着看被截断的内容，别把他拽回去
-        if (state.manualNoKbd) return;
-        state.manual = false;
-        if (currentShift(dlg) !== 0) setShift(dlg, 0);
+    const m = measure(dlg);
+    const active = document.activeElement;
+    const typing = !!(active && dlg.contains(active) && isEditable(active));
+    // 「该避让」= 检测到输入法，或者（在打字的前提下）底边确实被挡住了。
+    // 后一路是给检测不出输入法高度的环境兜底的；没在打字就绝不动别的弹窗。
+    const want = open || (typing && m.need > 1);
+
+    if (want) {
+        // 新的一轮 —— 手动拖过的锁只在同一轮里有效
+        if (!state.kbdWasOpen) {
+            state.kbdWasOpen = true;
+            state.manual = false;
+            state.manualNoKbd = false;
+        }
+        if (state.manual && !force) return;           // 这一轮里用户自己拉过，听他的
+        if (Math.abs(m.shift - currentShift(dlg)) < 1) return;
+        setShift(dlg, m.shift);
+        dbg('auto shift', m.shift, 'need', m.need, 'min', m.min);
         return;
     }
 
-    // 输入法「重新弹出」算新的一轮 —— 手动拖过的锁只在同一轮里有效。
-    // （安卓用返回键收输入法不会让输入框失焦，所以不能只靠 focusin 解锁）
-    if (!state.kbdWasOpen) {
-        state.kbdWasOpen = true;
+    // 这一轮结束了（输入法收了）→ **一定**回原位，哪怕这一轮里用手拖过。
+    // 安卓用输入法自带的收起键 / 返回键收输入法时输入框不会失焦，所以这件事
+    // 只能靠这里的状态翻转来做，靠 focusout 会漏。
+    if (state.kbdWasOpen) {
+        state.kbdWasOpen = false;
         state.manual = false;
         state.manualNoKbd = false;
+        if (currentShift(dlg) !== 0) setShift(dlg, 0);
+        dbg('keyboard round ended -> reset');
+        return;
     }
 
-    if (state.manual && !force) return;      // 这一轮里用户自己拉过，别跟他抢
-
-    const m = measure(dlg);
-    if (!m) return;
-    if (Math.abs(m.shift - currentShift(dlg)) < 1) return;
-    setShift(dlg, m.shift);
-    dbg('auto shift', m.shift, 'need', m.need, 'min', m.min);
+    // 从头到尾没输入法：用户自己拖着看被截断的内容，别把他拽回去
+    if (state.manual || state.manualNoKbd) return;
+    if (currentShift(dlg) !== 0) setShift(dlg, 0);
 }
 
 /** 把弹窗的最大高度钉在「输入法没开时」的视口高度上，输入法弹出时弹窗就不会变形抖动 */
@@ -375,6 +403,19 @@ function dragAllowedFrom(dlg, target) {
 }
 
 function bindDrag(dlg, state) {
+    let pendingY = null;
+    let frame = 0;
+
+    const shiftFor = (d) => clamp(d.start + (pendingY - d.y0), d.min, d.max);
+
+    // 一帧只写一次位移：安卓的 touchmove 比刷新率密得多，逐个写就是白掉帧
+    const flush = () => {
+        frame = 0;
+        const d = state.drag;
+        if (!d?.active || pendingY === null) return;
+        setShift(dlg, shiftFor(d), { fast: true });
+    };
+
     const begin = (y, target) => {
         if (!dragAllowedFrom(dlg, target)) {
             state.drag = null;
@@ -399,18 +440,30 @@ function bindDrag(dlg, state) {
             d.min = b.min;
             d.max = b.max;
             state.manual = true;                          // 之后不再自动推，听用户的
-            // 没输入法时拖 = 在看被截断的内容，别在轮询里把他拽回原位
-            state.manualNoKbd = !keyboardOpen();
+            // 全程没输入法时拖 = 在看被截断的内容，别在轮询里把他拽回原位。
+            // （有输入法的那一轮结束时一定回位，见 applyAutoShift）
+            state.manualNoKbd = !state.kbdWasOpen;
             dlg.classList.add('tpp-dragging');
         }
         // 关键：把这一串触摸的默认行为取消掉 —— 连带取消 click 与焦点变化，
         // 所以拉弹窗的时候输入法不会被收起来。
         prevent?.();
-        setShift(dlg, clamp(d.start + dy, d.min, d.max));
+        pendingY = y;
+        if (!frame) frame = requestAnimationFrame(flush);
     };
 
     const end = () => {
-        if (state.drag?.active) dlg.classList.remove('tpp-dragging');
+        if (frame) {
+            cancelAnimationFrame(frame);
+            frame = 0;
+        }
+        const d = state.drag;
+        if (d?.active) {
+            // 收尾这一次不用 fast：把 --tpp-shift 同步回去，关窗动画才不会跳
+            setShift(dlg, pendingY === null ? currentShift(dlg) : shiftFor(d));
+            dlg.classList.remove('tpp-dragging');
+        }
+        pendingY = null;
         state.drag = null;
     };
 
@@ -820,6 +873,7 @@ const TOGGLES = [
     ['roomyInput', '输入框更高（不那么扁）', 'Taller input field'],
     ['singleLine', '名字超长保持一行往右延伸', 'Keep the name on one line'],
     ['kbdAvoid', '输入法遮住时把弹窗往上推', 'Push the popup up when the keyboard covers it'],
+    ['kbdWholePopup', '连「取消 / 确认」一起顶到输入法上方（上面的内容推出屏幕）', 'Also lift the OK/Cancel row above the keyboard'],
     ['dragShift', '可以用手指上下拖动弹窗', 'Drag the popup up and down'],
     ['dragAlways', '输入法没开时也能拖', 'Allow dragging even without the keyboard'],
     ['dragOverflow', '弹窗比屏幕高时可以拖着看（手机）', 'Drag to peek when the popup is taller than the screen'],
@@ -833,7 +887,7 @@ const TOGGLES = [
 const NUMBERS = [
     ['popupWidth', '弹窗目标宽度 (px)', 'Popup width (px)', 360, 1200],
     ['inputHeight', '输入框最小高度 (px)', 'Input height (px)', 24, 96],
-    ['kbdMargin', '输入框与输入法的间距 (px)', 'Gap above the keyboard (px)', 0, 80],
+    ['kbdMargin', '弹窗底边与输入法的间距 (px)', 'Gap above the keyboard (px)', 0, 80],
     ['animMs', '开窗动画时长 (ms)', 'Animation duration (ms)', 60, 400],
 ];
 
@@ -899,7 +953,7 @@ function buildSettingsUI() {
     const hint = document.createElement('small');
     hint.className = 'tpp-hint';
     hint.textContent = isZh()
-        ? '弹窗相关的设置在下一次打开弹窗时生效。输入法把弹窗顶上去以后，在弹窗空白处上下滑动就能把它拉回来看，滑动不会收输入法；点一下空白处才收。'
+        ? '弹窗相关的设置在下一次打开弹窗时生效。输入法弹出时弹窗会整体上顶到「取消 / 确认」露出来（上面的内容顶出屏幕），在弹窗空白处上下滑动就能拉回来看，滑动不会收输入法；点一下空白处才收，输入法一收弹窗自动回位。'
         : 'Popup settings apply the next time a popup opens. Swipe on an empty area of the popup to pull it back; swiping keeps the keyboard open, a tap closes it.';
     content.appendChild(hint);
 

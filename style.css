@@ -10,13 +10,16 @@
     --tpp-css: 1;
     transform: translateY(var(--tpp-shift, 0px));
     transition: transform 0.18s cubic-bezier(0.22, 0.68, 0, 1);
+    /* 图层一开始就提出来。等手指动了才提 = 第一帧要重新光栅化整个弹窗，
+       那一下的黏手感就是从这来的。 */
+    will-change: transform;
+    backface-visibility: hidden;
 }
 
-/* 手指按着的时候必须跟手：不能有过渡，图层提前提出来，背景也别再实时模糊
+/* 手指按着的时候必须跟手：不能有过渡，背景也别再实时模糊
    （每帧重算高斯模糊 = 手机上最贵的一件事，拖动的顿挫感大半来自这里） */
 .popup.tpp-popup.tpp-dragging {
     transition: none;
-    will-change: transform;
 }
 
 .popup.tpp-popup.tpp-dragging[open]::backdrop {
@@ -206,6 +209,24 @@
 #tpp_settings .tpp-setting-row input[type="number"] {
     width: 6em;
     flex: 0 0 auto;
+    margin: 0;
+}
+
+#tpp_settings .tpp-advanced {
+    margin-top: 6px;
+    border-top: 1px solid rgba(255, 255, 255, 0.12);
+    padding-top: 4px;
+}
+
+#tpp_settings .tpp-advanced summary {
+    cursor: pointer;
+    opacity: 0.7;
+    padding: 3px 0;
+}
+
+#tpp_settings .tpp-setting-row select {
+    flex: 1 1 auto;
+    width: auto;
     margin: 0;
 }
 

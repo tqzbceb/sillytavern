@@ -23,8 +23,8 @@
 
 const MODULE_NAME = 'tavernPopupPolish';
 const LOG = '[popup-polish]';
-const VERSION = '1.4.0';
-const SETTINGS_REV = 2;    // 改过默认值就 +1，用来把旧的默认值迁移掉   // 面板标题后面会显示，用来确认装上的到底是哪一版
+const VERSION = '1.5.0';
+const SETTINGS_REV = 3;    // 改过默认值就 +1，用来把旧的默认值迁移掉   // 面板标题后面会显示，用来确认装上的到底是哪一版
 
 const DEFAULT_SETTINGS = {
     enabled: true,
@@ -40,15 +40,20 @@ const DEFAULT_SETTINGS = {
     inputHeight: 42,        // 输入框最小高度(px)
     singleLine: true,       // 名字超长时保持一行往右延伸，不换行
 
+    /* 新增 API 连接配置时预填的名字 */
+    nameMode: 'model',      // model=只要模型名 / model-preset / api-model / keep=原样不改
+
     /* 输入法避让 */
     kbdAvoid: true,         // 输入法遮住输入框时把弹窗往上推
     kbdWholePopup: true,    // 一次把弹窗底部（含「取消 / 确认」那一排）都顶到输入法上方
     liftMax: false,         // 不管输入法多高，一次顶到极限（输入框顶部贴着屏幕顶）
     assumeKbd: true,        // 环境完全测不出输入法高度时，按屏幕比例假定一个（TauriTavern 安卓常见）
     assumeKbdPct: 45,       // 假定输入法占屏幕高度的百分之几
+    blindSeen: false,       // 这个环境已经确认过「测不出输入法」——记下来，以后点输入框立刻上顶，不用再等
     kbdMargin: 16,          // 弹窗底部与输入法之间留的空(px)。按钮还是被挡住就把它调大（比如 60）
     kbdMinInset: 90,        // 视口底部被吃掉超过这个值才算「输入法开了」(px)
     dragShift: true,        // 可以用手指上下拖动弹窗
+    dragUpMax: 150,         // 自动避让之后，还允许往上多拖多少(px)。防止拖到只剩一个按钮
     dragAlways: false,      // 输入法没开时也允许拖动
     dragOverflow: true,     // 弹窗比屏幕高（顶部被切掉）时也允许拖着看
     freezeHeight: true,     // 输入法弹出时不让弹窗跟着 dvh 变高变矮（防抖）
@@ -99,6 +104,7 @@ function cfg() {
     }
     // 一次性迁移：老设置里存着的旧默认值要跟着改（光改 DEFAULT_SETTINGS 对老用户没用）
     if (!(own.rev >= 2)) own.widePopup = false;     // rev 1 → 2：弹窗宽度还给原生
+    if (!(own.rev >= 3)) own.dragUpMax = 150;       // rev 2 → 3：往上拖的范围收紧（以前能拖到只剩按钮）
     own.rev = SETTINGS_REV;
     return own;
 }
@@ -181,6 +187,48 @@ let baseLayoutH = 0;
 let kbdBlind = false;        // 已确认这个环境测不出输入法
 let assumedInset = 0;        // 当前按比例假定的输入法高度（0 = 没在假定）
 let vkTried = false;
+
+/**
+ * 「用户刚刚碰过的东西」。盲区里假定的输入法高度是**猜**的，只有在用户确实点了
+ * 弹窗里的输入框时才作数：
+ *   - 真手指点输入框  → 输入法一定会弹 → 立刻上顶（不用等，这是「推得慢」的解法）
+ *   - 程序自己 focus（弹窗 autofocus、失焦后被抢回来）→ 安卓不会弹输入法，
+ *     这时候乱顶就是那下「回位之后又闪一下跳上去」
+ */
+let lastTouch = { target: null, at: -1e9 };
+
+function noteUserPointer(target) {
+    lastTouch = { target: target instanceof Element ? target : null, at: performance.now() };
+}
+
+/**
+ * 这次 focus 该不该当成「输入法要来了」。两种算：
+ *   ① 用户的手指刚落在**这个输入框上** —— 点输入框，输入法必来
+ *   ② 弹窗刚刚打开（是用户点按钮打开的），客户端 autofocus 到输入框 —— 这一路
+ *      在 TauriTavern 上输入法也会跟着弹，所以照样算
+ * 关键是这两种都**不包括**「点了空白处收输入法之后，焦点被程序抢回输入框」——
+ * 那种情况输入法根本没弹，跟着顶一下就是用户看到的「回位后又闪一下」。
+ */
+function focusMeansKeyboard(dlg, state, target) {
+    const fresh = performance.now() - lastTouch.at < 1200;
+    const el = lastTouch.target;
+    if (fresh && el && (el === target || target.contains?.(el) || el.contains?.(target))) return true;
+    if (!state.hadRound && performance.now() - (state.openedAt || 0) < 900) return true;
+    return false;
+}
+
+/** 最近几次位移的流水（诊断用：闪一下这种问题，事后截图是看不见的，得有流水） */
+const trace = [];
+
+function note(reason, px) {
+    trace.push({ t: Math.round(performance.now()), px: Math.round(px), reason });
+    if (trace.length > 24) trace.shift();
+}
+
+function traceText() {
+    const now = performance.now();
+    return trace.slice(-5).map((e) => `${Math.round(now - e.t)}ms:${e.px}(${e.reason})`).join(' ');
+}
 
 /** VirtualKeyboard API：只有 overlaysContent = true 时才会给出键盘矩形 */
 function vkInset() {
@@ -328,8 +376,9 @@ function actualShift(dlg) {
  * 拖动时每帧几十次 → 那就是「拖起来卡卡的」的真凶。transform 不继承，只动合成器。
  * `--tpp-shift` 只在非拖动时同步一份，给开窗 / 关窗的 keyframes 用。
  */
-function setShift(dlg, px, { fast = false } = {}) {
+function setShift(dlg, px, { fast = false, why = '' } = {}) {
     const v = Math.round(px);
+    if (why && dlg.__tppShift !== v) note(why, v);
     dlg.__tppShift = v;
     dlg.style.transform = `translate3d(0, ${v}px, 0)`;
     if (!fast) dlg.style.setProperty('--tpp-shift', `${v}px`);
@@ -370,8 +419,14 @@ function bounds(dlg) {
     }
     hardMin = Math.min(0, hardMin);
 
+    // 手指能往上拖到哪：自动避让量再多 dragUpMax（默认 150px）。
+    // 不设这个上限就能一路拖到「只剩一个确定按钮」，很难看；
+    // 但上限永远不会越过 hardMin，所以输入框一定还在屏幕里，拖上去一定拖得回来。
+    const extra = Math.max(0, Number(cfg().dragUpMax) || 0);
+    const dragMin = Math.max(hardMin, Math.min(needMin, 0) - extra);
+
     const clipped = Math.max(0, vp.top - baseDlgTop);
-    return { min: hardMin, needMin, hardMin, max: cfg().dragOverflow ? clipped : 0, vp, shift, clipped };
+    return { min: dragMin, needMin, hardMin, dragMin, max: cfg().dragOverflow ? clipped : 0, vp, shift, clipped };
 }
 
 /**
@@ -405,7 +460,15 @@ function applyAutoShift(dlg, { force = false } = {}) {
     const typing = !!(active && dlg.contains(active) && isEditable(active));
     // 「该避让」= 检测到输入法，或者（在打字的前提下）底边确实被挡住了。
     // 后一路是给检测不出输入法高度的环境兜底的；没在打字就绝不动别的弹窗。
-    const want = open || (typing && m.need > 1);
+    let want = open || (typing && m.need > 1);
+
+    // 刚刚因为「输入法收了」回过位：这一小会儿不许再顶上去。
+    // 输入法收起的过程里各种信号会抖（原生层、VirtualKeyboard 的矩形、WebView 自己的滚动），
+    // 抖一下就重顶一次 = 用户看到的「回位之后又闪一下跳上去」。
+    // 用户真的又去点输入框时会把这个窗口清掉（见 noteFocusIn），所以不影响响应速度。
+    if (want && state.settleUntil && performance.now() < state.settleUntil) want = false;
+    // 假定的输入法高度是猜的，只在用户确实点过这个弹窗里的东西时才拿它顶
+    if (want && vp.source === 'assumed' && !state.armed) want = false;
 
     if (want) {
         // 新的一轮 —— 手动拖过的锁只在同一轮里有效
@@ -416,7 +479,7 @@ function applyAutoShift(dlg, { force = false } = {}) {
         }
         if (state.manual && !force) return;           // 这一轮里用户自己拉过，听他的
         if (Math.abs(m.shift - currentShift(dlg)) < 1) return;
-        setShift(dlg, m.shift);
+        setShift(dlg, m.shift, { why: vp.source });
         dbg('auto shift', m.shift, 'need', m.need, 'min', m.min);
         return;
     }
@@ -426,16 +489,19 @@ function applyAutoShift(dlg, { force = false } = {}) {
     // 只能靠这里的状态翻转来做，靠 focusout 会漏。
     if (state.kbdWasOpen) {
         state.kbdWasOpen = false;
+        state.hadRound = true;
         state.manual = false;
         state.manualNoKbd = false;
-        if (currentShift(dlg) !== 0) setShift(dlg, 0);
+        state.armed = false;
+        state.settleUntil = performance.now() + 450;   // 回位过程中不许被抖动的信号再顶上去
+        if (currentShift(dlg) !== 0) setShift(dlg, 0, { why: 'kbd-closed' });
         dbg('keyboard round ended -> reset');
         return;
     }
 
     // 从头到尾没输入法：用户自己拖着看被截断的内容，别把他拽回去
     if (state.manual || state.manualNoKbd) return;
-    if (currentShift(dlg) !== 0) setShift(dlg, 0);
+    if (currentShift(dlg) !== 0) setShift(dlg, 0, { why: 'idle' });
 }
 
 /** 一行诊断文本：把我们看到的视口 / 几何 / 结论全摊出来，排查用 */
@@ -453,10 +519,11 @@ function diagText(dlg) {
         `tpp v${VERSION} hook=${state?.how || lastHook} pops=${popups.size} enh=${dlg?.classList.contains('tpp-popup') ? 1 : 0}`,
         `layoutH=${n(vp.layoutH)} base=${n(baseLayoutH)} vvH=${n(vp.vvH)} ime=${n(vp.imeVar)} shrink=${n(vp.shrink)}`,
         `visible=${n(vp.top)}..${n(vp.bottom)} inset=${n(vp.inset)} kbd=${keyboardOpen(vp) ? 'YES' : 'no'} src=${vp.source}`,
-        `blind=${kbdBlind ? 1 : 0} assume=${n(assumedInset)} vk=${navigator.virtualKeyboard ? (vkTried ? 'on' : 'idle') : 'none'} mobile=${isMobileUA() ? 1 : 0}`,
+        `blind=${kbdBlind ? 1 : 0}/seen=${cfg().blindSeen ? 1 : 0} assume=${n(assumedInset)} vk=${navigator.virtualKeyboard ? (vkTried ? 'on' : 'idle') : 'none'} mobile=${isMobileUA() ? 1 : 0} arm=${state?.armed ? 1 : 0} settle=${state?.settleUntil > performance.now() ? 1 : 0}`,
         `dlg=${n(r?.top)}..${n(r?.bottom)} input=${n(ir?.top)}..${n(ir?.bottom)} ctrls=${n(ctrls?.top)}..${n(ctrls?.bottom)}`,
         `tag=${dlg?.tagName} css=${getComputedStyle(dlg).getPropertyValue('--tpp-css').trim() || 'NO'} ctrlsInDlg=${dlg?.querySelector('.popup-controls') ? 1 : 0}/doc=${document.querySelectorAll('.popup-controls').length} in1line=${input?.classList.contains('tpp-oneline') ? 1 : 0} inH=${n(ir?.height)}`,
-        `need=${n(m?.need)} shift=${n(dlg ? currentShift(dlg) : null)} hardMin=${n(m?.hardMin)} btnVisible=${okBtn}`,
+        `need=${n(m?.need)} shift=${n(dlg ? currentShift(dlg) : null)} dragMin=${n(m?.min)} hardMin=${n(m?.hardMin)} btn=${okBtn}`,
+        `last: ${traceText()}`,
     ].join('\n');
 }
 
@@ -503,11 +570,11 @@ function dragAllowedFrom(dlg, target) {
     if (!(target instanceof Element)) return true;
     if (target.closest('.popup-controls, .popup-button-close, button, select, option, a')) return false;
     if (isEditable(target)) return false;                 // 输入框里滑动是选字，不抢
-    // 自己能滚的容器交给它自己滚
+    // 自己能滚的容器交给它自己滚。先比高度（免费），只有真的溢出了才去问样式
+    // （getComputedStyle 会强制算样式，手指刚落下时最不该干这个）
     for (let el = target; el && el !== dlg; el = el.parentElement) {
-        const style = getComputedStyle(el);
-        const scrolls = /(auto|scroll)/.test(style.overflowY) && el.scrollHeight > el.clientHeight + 2;
-        if (scrolls) return false;
+        if (el.scrollHeight <= el.clientHeight + 2) continue;
+        if (/(auto|scroll)/.test(getComputedStyle(el).overflowY)) return false;
     }
     return true;
 }
@@ -547,7 +614,7 @@ function bindDrag(dlg, state) {
             }
             d.active = true;
             const b = bounds(dlg);
-            d.min = b.min;
+            d.min = Math.min(b.min, d.start);              // 已经顶得比上限还高时，别一碰就把他拽下来
             d.max = b.max;
             state.manual = true;                          // 之后不再自动推，听用户的
             // 全程没输入法时拖 = 在看被截断的内容，别在轮询里把他拽回原位。
@@ -569,9 +636,13 @@ function bindDrag(dlg, state) {
         }
         const d = state.drag;
         if (d?.active) {
-            // 收尾这一次不用 fast：把 --tpp-shift 同步回去，关窗动画才不会跳
-            setShift(dlg, pendingY === null ? currentShift(dlg) : shiftFor(d));
+            const last = pendingY === null ? currentShift(dlg) : shiftFor(d);
+            setShift(dlg, last, { fast: true, why: 'drag' });
             dlg.classList.remove('tpp-dragging');
+            // 松手之后再把 --tpp-shift 同步回去（关窗动画的 keyframes 要用它）。
+            // 自定义属性是会继承的，写一次整棵子树都要重算样式 —— 放到下一帧，
+            // 免得这活跟手指抬起来的那一帧撞在一起。
+            requestAnimationFrame(() => dlg.style.setProperty('--tpp-shift', `${Math.round(last)}px`));
         }
         pendingY = null;
         state.drag = null;
@@ -666,10 +737,96 @@ function applyInputLook(dlg, state) {
     return true;
 }
 
+/* ------------------------------------- 新增 API 连接配置的默认名字 */
+
+/**
+ * 「新增API连接配置」弹窗里那一排勾选项就是这份配置的字段。每个勾选框的
+ * `value` 是**英文字段名**（`API` / `Model` / `Settings Preset`…，客户端只翻译显示文字，
+ * 不动 value），所以拿它当 key 是稳的，中英文界面都能用。
+ * 改名弹窗（edit.html）的那排勾选项里没有值，认不出来 → 自动跳过，不碰用户的旧名字。
+ */
+function profileFields(dlg) {
+    const out = new Map();
+    for (const box of dlg.querySelectorAll('input[name="exclude"]')) {
+        const span = box.closest('label')?.querySelector('span');
+        const strong = span?.querySelector('strong');
+        if (!span || !strong) continue;
+        const value = span.textContent.replace(strong.textContent, '').replace(/\u00a0/g, ' ').trim();
+        if (value) out.set(box.value, value);
+    }
+    return out.size ? out : null;
+}
+
+function escapeRe(s) {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** 客户端预填的名字固定是 `${API} ${Model} - ${预设}`（重名时后面还有 ` (2)`）。
+ *  只有确认是这串**自动拼的**名字才替换 —— 用户自己打过字、或者在改名，一律不碰。 */
+function looksSuggested(value, fields) {
+    const base = `${fields.get('API') || ''} ${fields.get('Model') || ''} - ${fields.get('Settings Preset') || ''}`
+        .replace(/\s+/g, ' ').trim();
+    if (!base || base === '-') return false;
+    const v = String(value).trim();
+    return v === base || new RegExp(`^${escapeRe(base)} \\(\\d+\\)$`).test(v);
+}
+
+function composeName(fields, mode) {
+    const api = fields.get('API') || '';
+    const model = fields.get('Model') || '';
+    const preset = fields.get('Settings Preset') || '';
+    if (mode === 'model-preset') return [model, preset].filter(Boolean).join(' - ');
+    if (mode === 'api-model') return [api, model].filter(Boolean).join(' ');
+    return model;                                   // 默认：只要模型名
+}
+
+/** 已经存在的配置名（重名客户端会直接报错，所以自己加个 (2)） */
+function takenNames() {
+    const names = new Set();
+    for (const opt of document.querySelectorAll('#connection_profiles option')) {
+        const name = opt.textContent.trim();
+        if (name) names.add(name);
+    }
+    return names;
+}
+
+function uniqueName(name) {
+    const taken = takenNames();
+    if (!taken.has(name)) return name;
+    for (let i = 2; i < 200; i++) {
+        const candidate = `${name} (${i})`;
+        if (!taken.has(candidate)) return candidate;
+    }
+    return name;
+}
+
+/** 把预填的长名字换成用户选的写法（默认只留模型名） */
+function fixSuggestedName(dlg) {
+    const mode = cfg().nameMode;
+    if (!cfg().enabled || mode === 'keep') return false;
+    const input = mainInputOf(dlg);
+    if (!input) return false;
+    const fields = profileFields(dlg);
+    if (!fields || !looksSuggested(input.value, fields)) return false;
+
+    const name = uniqueName(composeName(fields, mode));
+    if (!name || name === input.value) return false;
+    input.value = name;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    try {
+        input.setSelectionRange(0, name.length);     // 跟原生一样全选，直接打字就能覆盖
+    } catch { /* ignore */ }
+    dbg('suggested name ->', name);
+    return true;
+}
+
 function enhance(dlg, how = 'unknown') {
     if (!cfg().enabled || popups.has(dlg)) return;
     const c = cfg();
-    const state = { input: mainInputOf(dlg), manual: false, manualNoKbd: false, kbdWasOpen: false, drag: null, how };
+    const state = {
+        input: mainInputOf(dlg), manual: false, manualNoKbd: false, kbdWasOpen: false, drag: null, how,
+        openedAt: performance.now(), armed: false, hadRound: false, settleUntil: 0,
+    };
     popups.set(dlg, state);
     lastHook = how;
 
@@ -687,6 +844,7 @@ function enhance(dlg, how = 'unknown') {
     }
 
     applyInputLook(dlg, state);
+    fixSuggestedName(dlg);
 
     bindDrag(dlg, state);
 
@@ -703,6 +861,7 @@ function enhance(dlg, how = 'unknown') {
     schedule();
     afterOpen(dlg, () => {
         applyInputLook(dlg, state);          // 开窗后输入框才量得到，补一次
+        fixSuggestedName(dlg);               // 接管得晚的话这时候才看得到预填的名字
         // 接管得晚（扫描兜底）时 focusin 可能已经过去了，这里补一次判定
         const active = document.activeElement;
         if (active && dlg.contains(active) && isEditable(active)) noteFocusIn(active);
@@ -781,6 +940,8 @@ function watchPopups() {
 
 function sweepPopups() {
     if (!cfg().enabled) return;
+    // 手指正按着的时候一个字都别查：looksOpen() 会读几何 = 强制重排，正好卡在拖动的每一帧上
+    for (const state of popups.values()) if (state.drag?.active) return;
     for (const el of document.querySelectorAll('.popup')) {
         if (popups.has(el)) continue;
         if (!looksOpen(el)) continue;
@@ -796,7 +957,15 @@ function noteFocusIn(target) {
     if (!isEditable(target)) return;
     if (!isMobileUA()) return;                       // 桌面没有软键盘，别乱顶
     const dlg = target.closest?.('.popup');
-    if (!dlg || !popups.has(dlg)) return;
+    const state = dlg ? popups.get(dlg) : null;
+    if (!state) return;
+
+    // 输入法要来了 → 允许拿假定的高度顶，并解除回位后的冷静期
+    const byUser = focusMeansKeyboard(dlg, state, target);
+    if (byUser) {
+        state.armed = true;
+        state.settleUntil = 0;
+    }
 
     const apply = () => {
         assumeTimer = 0;
@@ -809,6 +978,10 @@ function noteFocusIn(target) {
             return;
         }
         kbdBlind = true;
+        if (cfg().blindSeen !== true) {               // 记住这个环境，下次点输入框就不用再等
+            cfg().blindSeen = true;
+            saveCfg();
+        }
         if (vkInset() > 40) {                        // VirtualKeyboard API 能给真高度，最好
             assumedInset = 0;
         } else {
@@ -820,8 +993,10 @@ function noteFocusIn(target) {
     };
 
     clearTimeout(assumeTimer);
-    // 已经确认过是盲区的话立刻假定，第一次给输入法 350ms 让真实信号先说话
-    if (kbdBlind) apply();
+    // 这个环境已知测不出输入法（这次或上次会话确认过）+ 是用户自己点的 → 立刻顶，
+    // 不等输入法弹完（「输入法都出来了弹窗还没上去」就是等出来的）。
+    // 其余情况给真实信号 350ms 先说话。
+    if ((kbdBlind || cfg().blindSeen === true) && byUser) apply();
     else assumeTimer = setTimeout(apply, 350);
 }
 
@@ -839,6 +1014,12 @@ function noteFocusOut() {
 }
 
 function bindViewport() {
+    // 记住用户最后碰的是什么（判断一次 focus 是真手指点的还是程序抢的）
+    const seen = (e) => noteUserPointer(e.target);
+    document.addEventListener('touchstart', seen, { capture: true, passive: true });
+    document.addEventListener('pointerdown', seen, { capture: true, passive: true });
+    document.addEventListener('mousedown', seen, { capture: true, passive: true });
+
     const vv = window.visualViewport;
     vv?.addEventListener('resize', schedule);
     vv?.addEventListener('scroll', schedule);
@@ -1071,33 +1252,50 @@ function bindKeyGuards() {
 
 /* --------------------------------------------------- 扩展设置面板 */
 
+/* 常用的就这几项，其余全塞进「高级设置」折叠起来 */
 const TOGGLES = [
     ['enabled', '启用本扩展', 'Enable this extension'],
     ['keyReveal', '密钥框右边加「小眼睛」', 'Add an eye button next to the API key'],
+    ['kbdAvoid', '输入法弹出时把弹窗顶上去（带「取消 / 确认」）', 'Lift the popup above the keyboard'],
+    ['dragShift', '可以用手指上下拖动弹窗', 'Drag the popup up and down'],
+];
+
+const NUMBERS = [
+    ['assumeKbdPct', '输入法占屏幕高度 (%)：顶得不够就调大', 'Keyboard height (% of screen)', 20, 80],
+    ['dragUpMax', '往上最多再拖 (px)', 'Extra drag range upwards (px)', 0, 600],
+];
+
+const SELECTS = [
+    ['nameMode', '新配置的默认名字', 'Suggested profile name', [
+        ['model', '只要模型名', 'Model only'],
+        ['model-preset', '模型名 - 预设', 'Model - preset'],
+        ['api-model', 'API + 模型名', 'API + model'],
+        ['keep', '不改（客户端原来那串）', 'Leave it alone'],
+    ]],
+];
+
+const TOGGLES_ADV = [
     ['guardKeyHint', '不让已存的密钥出现在提示文字里', 'Keep the stored key out of the placeholder'],
     ['widePopup', '输入类弹窗更宽（默认关，宽度就是原生的）', 'Wider input popups'],
     ['roomyInput', '输入框更高（不那么扁）', 'Taller input field'],
     ['singleLine', '名字超长保持一行往右延伸', 'Keep the name on one line'],
-    ['kbdAvoid', '输入法遮住时把弹窗往上推', 'Push the popup up when the keyboard covers it'],
-    ['kbdWholePopup', '连「取消 / 确认」一起顶到输入法上方（上面的内容推出屏幕）', 'Also lift the OK/Cancel row above the keyboard'],
-    ['liftMax', '一次顶到最高（按钮还被挡住时勾这个）', 'Always lift as far as allowed'],
+    ['kbdWholePopup', '连「取消 / 确认」一起顶（关掉就只保证输入框露出来）', 'Also lift the OK/Cancel row'],
+    ['liftMax', '一次顶到最高', 'Always lift as far as allowed'],
     ['assumeKbd', '测不出输入法高度时按屏幕比例假定（安卓 WebView 必需）', 'Assume a keyboard height when it cannot be measured'],
-    ['dragShift', '可以用手指上下拖动弹窗', 'Drag the popup up and down'],
     ['dragAlways', '输入法没开时也能拖', 'Allow dragging even without the keyboard'],
-    ['dragOverflow', '弹窗比屏幕高时可以拖着看（手机）', 'Drag to peek when the popup is taller than the screen'],
+    ['dragOverflow', '弹窗比屏幕高时可以拖着看', 'Drag to peek when the popup is taller than the screen'],
     ['freezeHeight', '输入法弹出时不让弹窗变形', 'Freeze popup height while the keyboard is open'],
     ['smoothAnim', '换掉原生开窗动画（更顺）', 'Replace the native open animation'],
     ['cheapBackdrop', '弹窗背景不做高斯模糊（更顺）', 'No backdrop blur for popups'],
-    ['deferFocus', '等动画结束再弹输入法（更顺，个别环境可能不自动弹）', 'Focus the input after the animation'],
+    ['deferFocus', '等动画结束再弹输入法', 'Focus the input after the animation'],
     ['diag', '在弹窗里显示诊断信息（排查用）', 'Show a diagnostic readout inside the popup'],
     ['debug', '调试日志', 'Debug logging'],
 ];
 
-const NUMBERS = [
+const NUMBERS_ADV = [
     ['popupWidth', '弹窗目标宽度 (px)', 'Popup width (px)', 360, 1200],
     ['inputHeight', '输入框最小高度 (px)', 'Input height (px)', 24, 96],
     ['kbdMargin', '弹窗底边与输入法的间距 (px)', 'Gap above the keyboard (px)', 0, 80],
-    ['assumeKbdPct', '假定的输入法高度（占屏幕 %）', 'Assumed keyboard height (% of screen)', 20, 80],
     ['animMs', '开窗动画时长 (ms)', 'Animation duration (ms)', 60, 400],
 ];
 
@@ -1117,7 +1315,7 @@ function buildSettingsUI() {
         </div>`;
     const content = block.querySelector('.inline-drawer-content');
 
-    for (const [key, zh, en] of TOGGLES) {
+    const addToggle = (host, [key, zh, en]) => {
         const label = document.createElement('label');
         label.className = 'checkbox_label';
         const box = document.createElement('input');
@@ -1135,10 +1333,10 @@ function buildSettingsUI() {
             }
         });
         label.append(box, span);
-        content.appendChild(label);
-    }
+        host.appendChild(label);
+    };
 
-    for (const [key, zh, en, min, max] of NUMBERS) {
+    const addNumber = (host, [key, zh, en, min, max]) => {
         const row = document.createElement('div');
         row.className = 'flex-container alignItemsCenter tpp-setting-row';
         const span = document.createElement('span');
@@ -1157,14 +1355,51 @@ function buildSettingsUI() {
             saveCfg();
         });
         row.append(span, field);
-        content.appendChild(row);
-    }
+        host.appendChild(row);
+    };
+
+    const addSelect = (host, [key, zh, en, options]) => {
+        const row = document.createElement('div');
+        row.className = 'flex-container alignItemsCenter tpp-setting-row';
+        const span = document.createElement('span');
+        span.textContent = isZh() ? zh : en;
+        const select = document.createElement('select');
+        select.className = 'text_pole';
+        select.id = `tpp_sel_${key}`;
+        for (const [value, ozh, oen] of options) {
+            const opt = document.createElement('option');
+            opt.value = value;
+            opt.textContent = isZh() ? ozh : oen;
+            select.appendChild(opt);
+        }
+        select.value = String(cfg()[key]);
+        select.addEventListener('change', () => {
+            cfg()[key] = select.value;
+            saveCfg();
+        });
+        row.append(span, select);
+        host.appendChild(row);
+    };
+
+    for (const item of TOGGLES) addToggle(content, item);
+    for (const item of SELECTS) addSelect(content, item);
+    for (const item of NUMBERS) addNumber(content, item);
+
+    // 剩下的一堆折起来：平时不用看
+    const adv = document.createElement('details');
+    adv.className = 'tpp-advanced';
+    const sum = document.createElement('summary');
+    sum.textContent = isZh() ? '高级设置' : 'Advanced';
+    adv.appendChild(sum);
+    for (const item of TOGGLES_ADV) addToggle(adv, item);
+    for (const item of NUMBERS_ADV) addNumber(adv, item);
+    content.appendChild(adv);
 
     const hint = document.createElement('small');
     hint.className = 'tpp-hint';
     hint.textContent = isZh()
-        ? '弹窗相关的设置在下一次打开弹窗时生效。输入法弹出时弹窗会整体上顶到「取消 / 确认」露出来（上面的内容顶出屏幕），在弹窗空白处上下滑动就能拉回来看，滑动不会收输入法；点一下空白处才收，输入法一收弹窗自动回位。'
-        : 'Popup settings apply the next time a popup opens. Swipe on an empty area of the popup to pull it back; swiping keeps the keyboard open, a tap closes it.';
+        ? '设置在下一次打开弹窗时生效。输入法弹出时弹窗整体上顶，「取消 / 确认」一定露在键盘上方；在弹窗空白处上下滑动可以把上面的内容拉回来看（滑动不会收输入法，点一下空白才收，收了自动回位）。'
+        : 'Settings apply the next time a popup opens. Swipe on an empty area of the popup to pull it back; swiping keeps the keyboard open, a tap closes it.';
     content.appendChild(hint);
 
     host.appendChild(block);
@@ -1199,6 +1434,8 @@ function start() {
 globalThis.popupPolish = {
     VERSION, cfg, kbdState: () => ({ kbdBlind, assumedInset, vk: !!navigator.virtualKeyboard }), diagText, sweepPopups, applyAutoShift, saveCfg, viewport, keyboardOpen, measure, bounds, popups, eyes,
     enhance, ensureEyes, removeEyes, schedule, currentShift, setShift,
+    trace, traceText, noteUserPointer, noteFocusIn, noteFocusOut, fixSuggestedName, profileFields, composeName,
+    resetBlind: () => { kbdBlind = false; assumedInset = 0; },
 };
 
 const jq = globalThis.jQuery || globalThis.$;

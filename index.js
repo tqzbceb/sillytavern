@@ -23,7 +23,7 @@
 
 const MODULE_NAME = 'tavernPopupPolish';
 const LOG = '[popup-polish]';
-const VERSION = '1.5.0';
+const VERSION = '1.6.0';
 const SETTINGS_REV = 3;    // 改过默认值就 +1，用来把旧的默认值迁移掉   // 面板标题后面会显示，用来确认装上的到底是哪一版
 
 const DEFAULT_SETTINGS = {
@@ -42,6 +42,10 @@ const DEFAULT_SETTINGS = {
 
     /* 新增 API 连接配置时预填的名字 */
     nameMode: 'model',      // model=只要模型名 / model-preset / api-model / keep=原样不改
+
+    /* 新增 API 连接配置时那排「要一起保存哪些设置」的勾选项 */
+    rememberExclude: true,  // 记住上次点保存时没勾的项，下次打开自动还原成没勾
+    excludeMemory: [],      // 上次没勾的字段（英文字段名，跟界面语言无关）
 
     /* 输入法避让 */
     kbdAvoid: true,         // 输入法遮住输入框时把弹窗往上推
@@ -100,7 +104,7 @@ function cfg() {
     if (!store[MODULE_NAME]) store[MODULE_NAME] = {};
     const own = store[MODULE_NAME];
     for (const [k, v] of Object.entries(DEFAULT_SETTINGS)) {
-        if (own[k] === undefined) own[k] = v;
+        if (own[k] === undefined) own[k] = Array.isArray(v) ? [...v] : v;
     }
     // 一次性迁移：老设置里存着的旧默认值要跟着改（光改 DEFAULT_SETTINGS 对老用户没用）
     if (!(own.rev >= 2)) own.widePopup = false;     // rev 1 → 2：弹窗宽度还给原生
@@ -800,6 +804,51 @@ function uniqueName(name) {
     return name;
 }
 
+/** 这排勾选项 + 一个输入框 = 「新增API连接配置」那个弹窗（改名弹窗认不出字段值，会被排除掉） */
+function isCreateProfilePopup(dlg) {
+    return !!profileFields(dlg) && !!mainInputOf(dlg);
+}
+
+function excludeBoxes(dlg) {
+    return [...dlg.querySelectorAll('input[name="exclude"]')];
+}
+
+/**
+ * 把上次没勾的项还原成没勾。
+ * 注意：客户端是**监听勾选框的 input 事件**来维护「这份配置不保存哪些字段」的，
+ * 所以光把 `checked` 改掉只是看着没勾，必须把事件补发出去，客户端才真的不保存它。
+ */
+function applyExcludeMemory(dlg, state) {
+    if (!cfg().enabled || !cfg().rememberExclude || state.excludeApplied) return 0;
+    if (!isCreateProfilePopup(dlg)) return 0;
+    state.excludeApplied = true;                     // 只在开窗时还原一次，之后随用户改
+    const memory = cfg().excludeMemory;
+    if (!Array.isArray(memory) || !memory.length) return 0;
+
+    let n = 0;
+    for (const box of excludeBoxes(dlg)) {
+        if (!box.checked || !memory.includes(box.value)) continue;
+        box.checked = false;
+        box.dispatchEvent(new Event('input', { bubbles: true }));
+        box.dispatchEvent(new Event('change', { bubbles: true }));
+        n++;
+    }
+    dbg('exclude memory restored', memory, n);
+    return n;
+}
+
+/** 点了保存 → 把「现在没勾哪些」记下来（取消 / 关掉弹窗不记） */
+function rememberExclude(dlg) {
+    if (!cfg().enabled || !cfg().rememberExclude) return;
+    if (!isCreateProfilePopup(dlg)) return;
+    const list = excludeBoxes(dlg).filter((b) => !b.checked).map((b) => b.value);
+    const prev = Array.isArray(cfg().excludeMemory) ? cfg().excludeMemory : [];
+    if (prev.length === list.length && prev.every((v) => list.includes(v))) return;
+    cfg().excludeMemory = list;
+    saveCfg();
+    dbg('exclude memory saved', list);
+}
+
 /** 把预填的长名字换成用户选的写法（默认只留模型名） */
 function fixSuggestedName(dlg) {
     const mode = cfg().nameMode;
@@ -844,9 +893,20 @@ function enhance(dlg, how = 'unknown') {
     }
 
     applyInputLook(dlg, state);
+    applyExcludeMemory(dlg, state);
     fixSuggestedName(dlg);
 
     bindDrag(dlg, state);
+
+    // 点「保存」才记住这排勾选项（捕获阶段：在客户端读走这些值之前）。
+    // 输入框里按回车也是保存（客户端的 data-result-event="submit"）。
+    dlg.addEventListener('click', (e) => {
+        if (e.target instanceof Element && e.target.closest('.popup-button-ok')) rememberExclude(dlg);
+    }, true);
+    dlg.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter' || e.shiftKey) return;
+        if (e.target instanceof Element && e.target.classList.contains('popup-input')) rememberExclude(dlg);
+    }, true);
 
     // 用户点进弹窗里另一个输入框 → 重新按那个框避让
     dlg.addEventListener('focusin', () => {
@@ -861,6 +921,7 @@ function enhance(dlg, how = 'unknown') {
     schedule();
     afterOpen(dlg, () => {
         applyInputLook(dlg, state);          // 开窗后输入框才量得到，补一次
+        applyExcludeMemory(dlg, state);      // 接管得晚（扫描兜底）时这里才轮得到
         fixSuggestedName(dlg);               // 接管得晚的话这时候才看得到预填的名字
         // 接管得晚（扫描兜底）时 focusin 可能已经过去了，这里补一次判定
         const active = document.activeElement;
@@ -1258,6 +1319,7 @@ const TOGGLES = [
     ['keyReveal', '密钥框右边加「小眼睛」', 'Add an eye button next to the API key'],
     ['kbdAvoid', '输入法弹出时把弹窗顶上去（带「取消 / 确认」）', 'Lift the popup above the keyboard'],
     ['dragShift', '可以用手指上下拖动弹窗', 'Drag the popup up and down'],
+    ['rememberExclude', '记住上次没勾的项（新增配置弹窗）', 'Remember which settings you unchecked'],
 ];
 
 const NUMBERS = [
@@ -1435,6 +1497,7 @@ globalThis.popupPolish = {
     VERSION, cfg, kbdState: () => ({ kbdBlind, assumedInset, vk: !!navigator.virtualKeyboard }), diagText, sweepPopups, applyAutoShift, saveCfg, viewport, keyboardOpen, measure, bounds, popups, eyes,
     enhance, ensureEyes, removeEyes, schedule, currentShift, setShift,
     trace, traceText, noteUserPointer, noteFocusIn, noteFocusOut, fixSuggestedName, profileFields, composeName,
+    applyExcludeMemory, rememberExclude, isCreateProfilePopup,
     resetBlind: () => { kbdBlind = false; assumedInset = 0; },
 };
 

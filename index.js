@@ -23,6 +23,7 @@
 
 const MODULE_NAME = 'tavernPopupPolish';
 const LOG = '[popup-polish]';
+const VERSION = '1.2.1';   // 面板标题后面会显示，用来确认装上的到底是哪一版
 
 const DEFAULT_SETTINGS = {
     enabled: true,
@@ -900,7 +901,7 @@ function buildSettingsUI() {
     block.innerHTML = `
         <div class="inline-drawer">
             <div class="inline-drawer-toggle inline-drawer-header">
-                <b>${t('title')}</b>
+                <b>${t('title')}</b><small class="tpp-ver">v${VERSION}</small>
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
             <div class="inline-drawer-content flex-container flexFlowColumn"></div>
@@ -983,11 +984,11 @@ function start() {
         if (cfg().enabled && cfg().keyReveal) ensureEyes();
     }, 1500);
 
-    console.log(LOG, 'ready');
+    console.log(LOG, 'ready v' + VERSION);
 }
 
 globalThis.popupPolish = {
-    cfg, saveCfg, viewport, keyboardOpen, measure, bounds, popups, eyes,
+    VERSION, cfg, saveCfg, viewport, keyboardOpen, measure, bounds, popups, eyes,
     enhance, ensureEyes, removeEyes, schedule, currentShift, setShift,
 };
 

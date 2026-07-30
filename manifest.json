@@ -1,7 +1,7 @@
 {
     "display_name": "弹窗顺手 + 密钥小眼睛 (Popup Polish)",
     "name": "tavern-popup-polish",
-    "version": "1.2.1",
+    "version": "1.3.0",
     "author": "generated for TauriTavern / SillyTavern",
     "description": "手机酒馆专治两件事。① API 密钥框右边加「小眼睛」，点一下看明文（框空时向后端要已存的密钥）。② 输入类弹窗（新增/改名 API 连接配置、保存预设…）：输入法弹出时把弹窗整体上顶，直到输入框和「取消/确认」一起露在输入法上方（上面的内容推出屏幕），不用收输入法就能保存；想看上面的内容用手指把弹窗拉回来即可，拉动不关输入法；输入法一收（含输入法自带的收起键）弹窗自动回位。另外输入框更高、名字超长保持一行往右延伸、开窗动画换成不卡的位移淡入。兼容手机浏览器的 visualViewport、TauriTavern 的 --tt-ime-bottom、WebView 的 adjustResize。",
     "loading_order": 1001,

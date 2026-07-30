@@ -23,7 +23,7 @@
 
 const MODULE_NAME = 'tavernPopupPolish';
 const LOG = '[popup-polish]';
-const VERSION = '1.2.1';   // 面板标题后面会显示，用来确认装上的到底是哪一版
+const VERSION = '1.3.0';   // 面板标题后面会显示，用来确认装上的到底是哪一版
 
 const DEFAULT_SETTINGS = {
     enabled: true,
@@ -42,7 +42,8 @@ const DEFAULT_SETTINGS = {
     /* 输入法避让 */
     kbdAvoid: true,         // 输入法遮住输入框时把弹窗往上推
     kbdWholePopup: true,    // 一次把弹窗底部（含「取消 / 确认」那一排）都顶到输入法上方
-    kbdMargin: 10,          // 弹窗底部与输入法之间留的空(px)
+    liftMax: false,         // 不管输入法多高，一次顶到极限（输入框顶部贴着屏幕顶）—— 输入法高度测不准时用
+    kbdMargin: 16,          // 弹窗底部与输入法之间留的空(px)。按钮还是被挡住就把它调大（比如 60）
     kbdMinInset: 90,        // 视口底部被吃掉超过这个值才算「输入法开了」(px)
     dragShift: true,        // 可以用手指上下拖动弹窗
     dragAlways: false,      // 输入法没开时也允许拖动
@@ -55,6 +56,7 @@ const DEFAULT_SETTINGS = {
     cheapBackdrop: true,    // 弹窗背景不做高斯模糊（只保留压暗）
     deferFocus: false,      // 等开窗动画结束再聚焦输入框（输入法晚一点弹，更不卡；某些环境可能不自动弹输入法）
 
+    diag: false,          // 在弹窗里显示一条诊断信息（排查用）
     debug: false,
 };
 
@@ -185,13 +187,22 @@ function viewport() {
     // adjustResize 下布局视口已经不含输入法，可见区不可能超过它
     bottom = Math.min(bottom, layoutH);
 
+    const shrink = Math.max(0, baseLayoutH - layoutH);      // 布局视口自己缩了多少
+    const seen = Math.max(layoutH - bottom, shrink);        // 已经被别的信号反映出来的输入法高度
+
+    // 关键：`--tt-ime-bottom` 只在别的信号都没反映出输入法时才用。
+    // 否则（WebView 已经把布局视口压小、原生层又注入了输入法高度）会把输入法算两遍，
+    // 可见区直接被算成 0，避让量就永远被夹在极限上 —— 表现就是「改了跟没改一样」。
     const ime = cssPx('--tt-ime-bottom');
-    if (ime > 0) bottom = Math.min(bottom, layoutH - ime);
+    if (ime > 0 && seen < 40) bottom = Math.min(bottom, layoutH - ime);
 
     const test = Number(globalThis.__tppKbdInset);
-    if (Number.isFinite(test) && test > 0) bottom = Math.min(bottom, layoutH - test);
+    if (Number.isFinite(test) && test > 0) bottom = layoutH - test;
 
-    return { top, bottom, layoutH, inset: Math.max(0, layoutH - bottom) };
+    // 兜底：可见区再怎么算也不该只剩一条缝
+    if (bottom < 100) bottom = Math.min(layoutH, 100);
+
+    return { top, bottom, layoutH, inset: Math.max(0, layoutH - bottom), imeVar: ime, shrink, vvH: vv?.height || 0 };
 }
 
 function keyboardOpen(vp = viewport()) {
@@ -208,6 +219,9 @@ function keyboardOpen(vp = viewport()) {
 
 /** 当前被我们接管的弹窗 → 状态 */
 const popups = new Map();
+
+/** 最近一次是靠哪条路接管的（诊断用） */
+let lastHook = 'none';
 
 function isEditable(el) {
     if (!(el instanceof HTMLElement)) return false;
@@ -294,17 +308,21 @@ function bounds(dlg) {
     const dr = dlg.getBoundingClientRect();
     const baseDlgTop = dr.top - shift;
 
-    let min = -Math.max(0, avoidBottom(dlg, shift) + cfg().kbdMargin - vp.bottom);
+    // 需要顶多少（弹窗底边落到输入法上方）
+    const needMin = -Math.max(0, avoidBottom(dlg, shift) + cfg().kbdMargin - vp.bottom);
 
+    // 红线：正在输入的那个框的顶部不能出屏幕。手动拖动允许一直顶到这条线，
+    // 所以「上面的内容推出屏幕」是想推多少推多少，不再被自动量卡住。
     const target = shiftTarget(dlg);
+    let hardMin = needMin;
     if (target) {
         const r = target.getBoundingClientRect();
-        const inputLimit = -Math.max(0, (r.top - shift) - vp.top - 8);
-        min = Math.max(min, inputLimit);              // 两个都是负数，取“推得少”的那个当红线
+        hardMin = -Math.max(0, (r.top - shift) - vp.top - 8);
     }
+    hardMin = Math.min(0, hardMin);
 
     const clipped = Math.max(0, vp.top - baseDlgTop);
-    return { min, max: cfg().dragOverflow ? clipped : 0, vp, shift, clipped };
+    return { min: hardMin, needMin, hardMin, max: cfg().dragOverflow ? clipped : 0, vp, shift, clipped };
 }
 
 /**
@@ -315,8 +333,10 @@ function bounds(dlg) {
 function measure(dlg) {
     const b = bounds(dlg);
     const need = avoidBottom(dlg, b.shift) + cfg().kbdMargin - b.vp.bottom;
+    // liftMax：不信输入法高度，直接顶到红线（输入框贴着屏幕顶）—— 测不准的环境用这个稳
+    const want = cfg().liftMax && need > 1 ? b.hardMin : -Math.max(0, need);
 
-    return { shift: clamp(-Math.max(0, need), b.min, 0), min: b.min, max: b.max, need, vp: b.vp };
+    return { shift: clamp(want, b.hardMin, 0), min: b.min, hardMin: b.hardMin, max: b.max, need, vp: b.vp };
 }
 
 function applyAutoShift(dlg, { force = false } = {}) {
@@ -328,6 +348,8 @@ function applyAutoShift(dlg, { force = false } = {}) {
     const vp = viewport();
     const open = keyboardOpen(vp);
     if (cfg().freezeHeight && !open) freezeHeight(dlg);
+
+    if (cfg().diag || dlg.__tppDiag) renderDiag(dlg);
 
     const m = measure(dlg);
     const active = document.activeElement;
@@ -365,6 +387,43 @@ function applyAutoShift(dlg, { force = false } = {}) {
     // 从头到尾没输入法：用户自己拖着看被截断的内容，别把他拽回去
     if (state.manual || state.manualNoKbd) return;
     if (currentShift(dlg) !== 0) setShift(dlg, 0);
+}
+
+/** 一行诊断文本：把我们看到的视口 / 几何 / 结论全摊出来，排查用 */
+function diagText(dlg) {
+    const vp = viewport();
+    const m = dlg ? measure(dlg) : null;
+    const r = dlg?.getBoundingClientRect();
+    const state = dlg ? popups.get(dlg) : null;
+    const input = state?.input || (dlg ? mainInputOf(dlg) : null);
+    const ir = input?.getBoundingClientRect();
+    const ctrls = dlg?.querySelector('.popup-controls')?.getBoundingClientRect();
+    const n = (v) => (v === undefined || v === null ? '-' : Math.round(v));
+    const okBtn = ctrls ? (ctrls.bottom <= vp.bottom + 2 ? 'YES' : 'NO') : '-';
+    return [
+        `tpp v${VERSION} hook=${state?.how || lastHook} pops=${popups.size} enh=${dlg?.classList.contains('tpp-popup') ? 1 : 0}`,
+        `layoutH=${n(vp.layoutH)} base=${n(baseLayoutH)} vvH=${n(vp.vvH)} ime=${n(vp.imeVar)} shrink=${n(vp.shrink)}`,
+        `visible=${n(vp.top)}..${n(vp.bottom)} inset=${n(vp.inset)} kbd=${keyboardOpen(vp) ? 'YES' : 'no'}`,
+        `dlg=${n(r?.top)}..${n(r?.bottom)} input=${n(ir?.top)}..${n(ir?.bottom)} ctrls=${n(ctrls?.top)}..${n(ctrls?.bottom)}`,
+        `tag=${dlg?.tagName} css=${getComputedStyle(dlg).getPropertyValue('--tpp-css').trim() || 'NO'} ctrlsInDlg=${dlg?.querySelector('.popup-controls') ? 1 : 0}/doc=${document.querySelectorAll('.popup-controls').length} in1line=${input?.classList.contains('tpp-oneline') ? 1 : 0} inH=${n(ir?.height)}`,
+        `need=${n(m?.need)} shift=${n(dlg ? currentShift(dlg) : null)} hardMin=${n(m?.hardMin)} btnVisible=${okBtn}`,
+    ].join('\n');
+}
+
+function renderDiag(dlg) {
+    const on = cfg().diag;
+    dlg.__tppDiag = on;
+    let box = dlg.querySelector(':scope > .popup-body > .tpp-diag') || dlg.querySelector('.tpp-diag');
+    if (!on) {
+        box?.remove();
+        return;
+    }
+    if (!box) {
+        box = document.createElement('pre');
+        box.className = 'tpp-diag';
+        (dlg.querySelector('.popup-body') || dlg).appendChild(box);
+    }
+    box.textContent = diagText(dlg);
 }
 
 /** 把弹窗的最大高度钉在「输入法没开时」的视口高度上，输入法弹出时弹窗就不会变形抖动 */
@@ -534,12 +593,35 @@ function afterOpen(dlg, callback) {
     setTimeout(run, (cfg().animMs || 150) + 120);
 }
 
-function enhance(dlg) {
+/** 输入框相关的外观处理。弹窗还没打开时可能拿不到输入框，所以开窗后会再调一次。 */
+function applyInputLook(dlg, state) {
+    const c = cfg();
+    const input = state.input || mainInputOf(dlg);
+    if (!input) return false;
+    state.input = input;
+
+    dlg.classList.add('tpp-input-popup');
+    if (c.widePopup) {
+        dlg.classList.add('tpp-wide');
+        dlg.style.setProperty('--tpp-width', `${c.popupWidth}px`);
+    }
+    if (c.roomyInput) {
+        dlg.classList.add('tpp-roomy');
+        dlg.style.setProperty('--tpp-input-height', `${c.inputHeight}px`);
+    }
+    if (c.singleLine && (Number(input.rows) || 1) <= 1) {
+        input.classList.add('tpp-oneline');
+        input.setAttribute('wrap', 'off');
+    }
+    return true;
+}
+
+function enhance(dlg, how = 'unknown') {
     if (!cfg().enabled || popups.has(dlg)) return;
     const c = cfg();
-    const input = mainInputOf(dlg);
-    const state = { input, manual: false, manualNoKbd: false, kbdWasOpen: false, drag: null };
+    const state = { input: mainInputOf(dlg), manual: false, manualNoKbd: false, kbdWasOpen: false, drag: null, how };
     popups.set(dlg, state);
+    lastHook = how;
 
     dlg.classList.add('tpp-popup');
     setShift(dlg, 0);
@@ -554,21 +636,7 @@ function enhance(dlg) {
         freezeHeight(dlg);
     }
 
-    if (input) {
-        dlg.classList.add('tpp-input-popup');
-        if (c.widePopup) {
-            dlg.classList.add('tpp-wide');
-            dlg.style.setProperty('--tpp-width', `${c.popupWidth}px`);
-        }
-        if (c.roomyInput) {
-            dlg.classList.add('tpp-roomy');
-            dlg.style.setProperty('--tpp-input-height', `${c.inputHeight}px`);
-        }
-        if (c.singleLine && (Number(input.rows) || 1) <= 1) {
-            input.classList.add('tpp-oneline');
-            input.setAttribute('wrap', 'off');
-        }
-    }
+    applyInputLook(dlg, state);
 
     bindDrag(dlg, state);
 
@@ -581,9 +649,12 @@ function enhance(dlg) {
     });
     dlg.addEventListener('input', schedule);
 
-    dbg('enhanced', { input: !!input, classes: dlg.className });
+    dbg('enhanced', { how, input: !!state.input, classes: dlg.className });
     schedule();
-    afterOpen(dlg, () => schedule());
+    afterOpen(dlg, () => {
+        applyInputLook(dlg, state);          // 开窗后输入框才量得到，补一次
+        schedule();
+    });
 }
 
 /**
@@ -599,7 +670,7 @@ function patchShowModal() {
         let deferred = null;
         try {
             if (this.classList?.contains('popup') && cfg().enabled) {
-                enhance(this);
+                enhance(this, 'showModal');
                 if (cfg().deferFocus && mainInputOf(this)) {
                     const auto = this.querySelector('[autofocus]');
                     if (auto) {
@@ -625,19 +696,43 @@ function patchShowModal() {
     proto.__tppPatched = true;
 }
 
-/** 兜底：有些环境走 dialog polyfill，不经过 showModal */
+/** 这个元素现在是不是一个「开着的」弹窗（polyfill 的 dialog 可能不是 <dialog>，也可能没有 open 属性） */
+function looksOpen(el) {
+    if (!(el instanceof HTMLElement)) return false;
+    if (el.hasAttribute('open') || el.open === true) return true;
+    if (el.hasAttribute('closing')) return false;
+    return !!el.offsetParent && el.getBoundingClientRect().height > 0;
+}
+
+/**
+ * 兜底 1：DOM 观察（整棵树，不只 body 的直接子节点 —— 有的客户端会把弹窗塞进容器里）。
+ * 兜底 2：定时扫一遍所有 .popup。只要 showModal 补丁和观察器都漏了（老 WebView 没有
+ *        HTMLDialogElement、走 polyfill、或者客户端用 show() 而不是 showModal()），
+ *        这一路也能把弹窗接管过来。
+ */
 function watchPopups() {
     const observer = new MutationObserver((records) => {
         for (const record of records) {
             for (const node of record.addedNodes) {
-                if (node instanceof HTMLElement && node.matches?.('dialog.popup')) enhance(node);
+                if (!(node instanceof HTMLElement)) continue;
+                if (node.matches?.('.popup')) enhance(node, 'observer');
+                else node.querySelectorAll?.('.popup').forEach((el) => enhance(el, 'observer-sub'));
             }
             for (const node of record.removedNodes) {
                 if (node instanceof HTMLElement && popups.has(node)) forget(node);
             }
         }
     });
-    observer.observe(document.body, { childList: true });
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+}
+
+function sweepPopups() {
+    if (!cfg().enabled) return;
+    for (const el of document.querySelectorAll('.popup')) {
+        if (popups.has(el)) continue;
+        if (!looksOpen(el)) continue;
+        enhance(el, 'sweep');
+    }
 }
 
 function bindViewport() {
@@ -651,6 +746,7 @@ function bindViewport() {
     // 测试 / 兜底钩子：有的 WebView 不发 visualViewport 事件
     document.addEventListener('tpp-viewport', schedule);
     setInterval(() => {
+        sweepPopups();
         if (popups.size) schedule();
     }, 250);
 }
@@ -875,6 +971,7 @@ const TOGGLES = [
     ['singleLine', '名字超长保持一行往右延伸', 'Keep the name on one line'],
     ['kbdAvoid', '输入法遮住时把弹窗往上推', 'Push the popup up when the keyboard covers it'],
     ['kbdWholePopup', '连「取消 / 确认」一起顶到输入法上方（上面的内容推出屏幕）', 'Also lift the OK/Cancel row above the keyboard'],
+    ['liftMax', '一次顶到最高（输入法高度测不准 / 按钮还被挡住时勾这个）', 'Always lift as far as allowed'],
     ['dragShift', '可以用手指上下拖动弹窗', 'Drag the popup up and down'],
     ['dragAlways', '输入法没开时也能拖', 'Allow dragging even without the keyboard'],
     ['dragOverflow', '弹窗比屏幕高时可以拖着看（手机）', 'Drag to peek when the popup is taller than the screen'],
@@ -882,6 +979,7 @@ const TOGGLES = [
     ['smoothAnim', '换掉原生开窗动画（更顺）', 'Replace the native open animation'],
     ['cheapBackdrop', '弹窗背景不做高斯模糊（更顺）', 'No backdrop blur for popups'],
     ['deferFocus', '等动画结束再弹输入法（更顺，个别环境可能不自动弹）', 'Focus the input after the animation'],
+    ['diag', '在弹窗里显示诊断信息（排查用）', 'Show a diagnostic readout inside the popup'],
     ['debug', '调试日志', 'Debug logging'],
 ];
 
@@ -988,7 +1086,7 @@ function start() {
 }
 
 globalThis.popupPolish = {
-    VERSION, cfg, saveCfg, viewport, keyboardOpen, measure, bounds, popups, eyes,
+    VERSION, cfg, diagText, sweepPopups, applyAutoShift, saveCfg, viewport, keyboardOpen, measure, bounds, popups, eyes,
     enhance, ensureEyes, removeEyes, schedule, currentShift, setShift,
 };
 

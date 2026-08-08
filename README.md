@@ -1,4 +1,4 @@
-# 弹窗顺手 + 密钥小眼睛 (tavern-popup-polish) v1.7.0
+# 弹窗顺手 + 密钥小眼睛 (tavern-popup-polish) v1.7.1
 
 **为手机上的 SillyTavern（浏览器访问）和 TauriTavern（安卓 WebView）做的**，桌面上也能用。
 只动两处：**API 密钥框**和**输入类弹窗**，别的地方一个字不改。
@@ -62,6 +62,20 @@
   一轮结束 → 一定回原位并解锁；再弹出 = 新一轮，重新自动避让。不靠 `focusout`（那样会漏）。
 - **兜底一路**：万一某个环境的输入法高度四路都读不出来，只要「焦点在输入框里」且「弹窗底边确实
   被压在可见区外」，也会照样往上顶。没在打字时绝不动任何弹窗。
+
+## v1.7.1：修切换 OAI 预设时 Unauthorized toast 没被压住的问题
+
+v1.7.0 的抑制器漏了两个关键感知路径,在你「切之前已经能正常聊天」的场景下 toast 仍然弹出:
+
+1. **切 OAI 预设的下拉 selector 漏了** —— ST 里这个下拉的真实 id 是 `#settings_preset_openai`,
+   原来兜底监听的 selector 列表里没有它,所以切预设时 `arm` 不上窗口,toast 漏网。
+   现在把 `#settings_preset_openai`、`#preset_select_openai` 都加进监听。
+2. **「在线就放行」这条判别对切换预设法场景是错的** —— 切预设法恰恰是发生在「在线」状态
+   (你之前已经连着某个 API,只是换了一把 token),把它当作「在线 = 真实 401」会放过所有切换误报。
+   现在去掉这条判别,只靠「切换窗口期内 + 文案同时含 `chat completions status` 和 `Unauthorized`」
+   两条件判别;真正聊天时的 401 文案一般是 `Chat completion error: …`,不撞这两段,误伤风险更低。
+3. 另加了点击 `#api_button_openai` / `#api_button` 那一刻 arm 窗口的兜底 —— 切预设法会连锁
+   `trigger('#api_button_openai')` 打 status,arm 在这一发之前更保险。
 
 ## v1.7.0：插件面板默认收起 + 压住切换连接配置时的 Unauthorized 误报
 

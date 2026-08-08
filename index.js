@@ -23,7 +23,7 @@
 
 const MODULE_NAME = 'tavernPopupPolish';
 const LOG = '[popup-polish]';
-const VERSION = '1.7.0';
+const VERSION = '1.7.1';
 const SETTINGS_REV = 4;    // 改过默认值就 +1，用来把旧的默认值迁移掉   // 面板标题后面会显示，用来确认装上的到底是哪一版
 
 const DEFAULT_SETTINGS = {
@@ -1327,27 +1327,24 @@ function bindKeyGuards() {
  * 切换 connection profile / API / preset 时，客户端会立刻 trigger('#api_button_*')
  * 去打 /api/backends/chat-completions/status —— 这一发不等 waitUntilCondition，可能用还没
  * 生效的 token，上游回 401，后端包成「后端错误 Failed to get chat completions status:
- * Unauthorized (request id: …)」弹出来。真实连接事后是好的。
+ * Unauthorized: Invalid token (request id: …)」弹出来。真实连接事后是好的。
  *
- * 这里只在「明显是切换过早」的窗口里把这一条 toast 吞掉：
+ * 注意：切换 preset 这个动作恰恰是发生「在线状态」的（你之前一直能聊天，只是换了个 token），
+ * 所以不能用「在线就放行」来区分真假 401 —— 那样会把切换误报全放过。
+ *
+ * 真假 401 的边界只靠两条：
  *   ① 我们刚感知到一次切换（事件 / 下拉 change），且在 switchGraceMs 内；
- *   ② 连接还没真正建立（online_status 还是 no_connection —— 用 ONLINE_STATUS_CHANGED 跟踪）；
- *   ③ toast 文案同时匹配「chat completions status」和「Unauthorized」。
- * 三条全中才吞；缺任意一条都原样转发，避免把真实 401 也吃掉。
+ *   ② toast 文案同时匹配「chat completions status」和「Unauthorized」。
+ * 两条全中才吞。聊天时真实 401 的文案一般是「Chat completion error: …」，不含
+ * 「chat completions status」，撞不上；window 外的也撞不上。所以这组判别够窄。
  */
 
 let switchArmedAt = 0;          // 最近一次感知到切换的时间戳，0 = 没有
-let onlineIsConnected = false;  // 最近一次 ONLINE_STATUS_CHANGED 反映的连接状态
 
 function armSwitchWindow() {
     if (!cfg().enabled || !cfg().suppressSwitchErrors) return;
     switchArmedAt = performance.now();
     dbg('switch window armed (error suppression active)');
-}
-
-function noteOnlineStatus(value) {
-    onlineIsConnected = value !== 'no_connection';
-    if (onlineIsConnected) switchArmedAt = 0;   // 连上了：再出现这种 toast 是真实问题，不吞
 }
 
 async function bindSwitchErrorSuppressor() {
@@ -1374,18 +1371,23 @@ async function bindSwitchErrorSuppressor() {
                 try { eventSource.on(name, onSwitch); } catch { /* ignore */ }
             }
         }
-        if (typeof eventTypes.ONLINE_STATUS_CHANGED === 'string') {
-            try {
-                eventSource.on(eventTypes.ONLINE_STATUS_CHANGED, noteOnlineStatus);
-            } catch { /* ignore */ }
-        }
     }
 
     // 兜底：下拉 change。TauriTavern 上事件系统不一定全发，下拉这一路最实在。
-    const switchySelectors = '#connection_profiles, #main_api, #chat_completion_source, #textgen_type';
+    // 注意 OAI preset 下拉在 ST 里叫 #settings_preset_openai（不是 #preset_select），
+    // 这一项之前漏了，导致切 OAI preset 时 arm 不上窗口，Unauthorized toast 漏网。
+    const switchySelectors = '#connection_profiles, #main_api, #chat_completion_source, #textgen_type, #settings_preset_openai, #preset_select_openai';
     document.addEventListener('change', (event) => {
         if (!(event.target instanceof Element)) return;
         if (!event.target.matches(switchySelectors)) return;
+        armSwitchWindow();
+    }, true);
+
+    // 另一路兜底：拦截「点连接按钮 / API 按钮被 trigger」那一刻 —— 切 preset 会连锁
+    // trigger('#api_button_openai') 去打 status，arm 在这一发之前更保险。
+    document.addEventListener('click', (event) => {
+        if (!(event.target instanceof Element)) return;
+        if (!event.target.closest('#api_button_openai, #api_button')) return;
         armSwitchWindow();
     }, true);
 
@@ -1394,13 +1396,25 @@ async function bindSwitchErrorSuppressor() {
 
 function shouldSuppressSwitchError(message, title) {
     if (!cfg().enabled || !cfg().suppressSwitchErrors) return false;
-    if (switchArmedAt === 0) return false;
+    if (switchArmedAt === 0) {
+        dbg('toast not suppressed: no switch armed (no switch perceived)');
+        return false;
+    }
     const grace = Math.max(0, Number(cfg().switchGraceMs) || 0);
-    if (grace > 0 && performance.now() - switchArmedAt > grace) return false;
-    if (onlineIsConnected) return false;     // 已连上还弹 Unauthorized = 真实问题
+    const since = performance.now() - switchArmedAt;
+    if (grace > 0 && since > grace) {
+        dbg('toast not suppressed: grace expired', { since, grace });
+        return false;
+    }
     const text = `${title ?? ''} ${message ?? ''}`;
-    // 两段文案都在才吞 —— 缺一段就放行，避免误伤其它真实 401
-    return /chat completions status/i.test(text) && /Unauthorized/i.test(text);
+    const hitStatus = /chat completions status/i.test(text);
+    const hitUnauth = /Unauthorized/i.test(text);
+    if (!(hitStatus && hitUnauth)) {
+        dbg('toast not suppressed: text mismatch', { hitStatus, hitUnauth, text });
+        return false;
+    }
+    dbg('toast SUPPRESSED:', { message, title, since, grace });
+    return true;
 }
 
 function wrapToastrError() {

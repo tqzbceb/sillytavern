@@ -1,7 +1,7 @@
 {
     "display_name": "弹窗顺手 + 密钥小眼睛 (Popup Polish)",
     "name": "tavern-popup-polish",
-    "version": "1.7.0",
+    "version": "1.7.1",
     "author": "generated for TauriTavern / SillyTavern",
     "description": "手机酒馆三件事。① API 密钥框右边加「小眼睛」看明文。② 输入类弹窗（新增/改名 API 连接配置等）：手指一点输入框就把输入框和「取消/确认」一起顶到输入法上方（上面的内容推出屏幕，手指可以拖回来看，拖动不关输入法，往上拖的范围可设），输入框更高、名字超长保持一行；新增 API 连接配置的默认名字默认只留模型名，那排「要保存哪些设置」的勾选项也会记住上次的选择。③ 切换连接配置/API/预设时 TauriTavern 常弹「后端错误 Failed to get chat completions status: Unauthorized」误报（检测早于真正连上），自动在切换后的宽限窗口里压住这一条 toast，真连不上仍会正常报。扩展面板默认折叠在插件列表里。兼容手机浏览器的 visualViewport、TauriTavern 的 --tt-ime-bottom、WebView 的 adjustResize，以及完全测不出输入法高度的安卓 WebView（VirtualKeyboard API / 按屏幕比例假定）。默认不改弹窗宽度。",
     "loading_order": 1001,

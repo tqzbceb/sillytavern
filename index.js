@@ -23,8 +23,8 @@
 
 const MODULE_NAME = 'tavernPopupPolish';
 const LOG = '[popup-polish]';
-const VERSION = '1.6.0';
-const SETTINGS_REV = 3;    // 改过默认值就 +1，用来把旧的默认值迁移掉   // 面板标题后面会显示，用来确认装上的到底是哪一版
+const VERSION = '1.7.0';
+const SETTINGS_REV = 4;    // 改过默认值就 +1，用来把旧的默认值迁移掉   // 面板标题后面会显示，用来确认装上的到底是哪一版
 
 const DEFAULT_SETTINGS = {
     enabled: true,
@@ -46,6 +46,16 @@ const DEFAULT_SETTINGS = {
     /* 新增 API 连接配置时那排「要一起保存哪些设置」的勾选项 */
     rememberExclude: true,  // 记住上次点保存时没勾的项，下次打开自动还原成没勾
     excludeMemory: [],      // 上次没勾的字段（英文字段名，跟界面语言无关）
+
+    /* 切换连接配置时的「后端错误 / Unauthorized」误报抑制 */
+    // 根因：切换 connection profile / API / preset 时客户端会立刻 trigger('#api_button_*')
+    // 去打 /api/backends/chat-completions/status，这个请求不等 waitUntilCondition，可能用
+    // 还没生效的 token 去请求 → 上游返回 401 → 后端把它包成
+    // 「后端错误 Failed to get chat completions status: Unauthorized (request id: …)」弹出来。
+    // 真实连接事后是好的。这里只在这一类「明显是切换过早」的窗口里吞掉那一条 toast。
+    suppressSwitchErrors: true,   // 关掉就把这个抑制整个停掉，误报照常弹
+    switchGraceMs: 6000,          // 感知到切换后这毫秒内是「误报窗口」
+    // 也可以显式调大。各路切换事件都用这同一个值
 
     /* 输入法避让 */
     kbdAvoid: true,         // 输入法遮住输入框时把弹窗往上推
@@ -1311,6 +1321,107 @@ function bindKeyGuards() {
     }, true);
 }
 
+/* --------------------------------------------------- 切换连接配置的误报抑制 */
+
+/**
+ * 切换 connection profile / API / preset 时，客户端会立刻 trigger('#api_button_*')
+ * 去打 /api/backends/chat-completions/status —— 这一发不等 waitUntilCondition，可能用还没
+ * 生效的 token，上游回 401，后端包成「后端错误 Failed to get chat completions status:
+ * Unauthorized (request id: …)」弹出来。真实连接事后是好的。
+ *
+ * 这里只在「明显是切换过早」的窗口里把这一条 toast 吞掉：
+ *   ① 我们刚感知到一次切换（事件 / 下拉 change），且在 switchGraceMs 内；
+ *   ② 连接还没真正建立（online_status 还是 no_connection —— 用 ONLINE_STATUS_CHANGED 跟踪）；
+ *   ③ toast 文案同时匹配「chat completions status」和「Unauthorized」。
+ * 三条全中才吞；缺任意一条都原样转发，避免把真实 401 也吃掉。
+ */
+
+let switchArmedAt = 0;          // 最近一次感知到切换的时间戳，0 = 没有
+let onlineIsConnected = false;  // 最近一次 ONLINE_STATUS_CHANGED 反映的连接状态
+
+function armSwitchWindow() {
+    if (!cfg().enabled || !cfg().suppressSwitchErrors) return;
+    switchArmedAt = performance.now();
+    dbg('switch window armed (error suppression active)');
+}
+
+function noteOnlineStatus(value) {
+    onlineIsConnected = value !== 'no_connection';
+    if (onlineIsConnected) switchArmedAt = 0;   // 连上了：再出现这种 toast 是真实问题，不吞
+}
+
+async function bindSwitchErrorSuppressor() {
+    const context = ctx();
+    const eventTypes = context?.event_types;
+    const eventSource = context?.eventSource;
+
+    if (eventSource && eventTypes) {
+        const onSwitch = () => armSwitchWindow();
+        const names = [
+            eventTypes.CONNECTION_PROFILE_LOADED,
+            eventTypes.CONNECTION_PROFILE_CREATED,
+            eventTypes.CONNECTION_PROFILE_UPDATED,
+            eventTypes.MAIN_API_CHANGED,
+            eventTypes.CHATCOMPLETION_SOURCE_CHANGED,
+            eventTypes.OAI_PRESET_CHANGED_BEFORE,
+            eventTypes.OAI_PRESET_CHANGED_AFTER,
+            eventTypes.PRESET_CHANGED,
+            eventTypes.SECRET_WRITTEN,
+            eventTypes.SECRET_ROTATED,
+        ];
+        for (const name of names) {
+            if (typeof name === 'string') {
+                try { eventSource.on(name, onSwitch); } catch { /* ignore */ }
+            }
+        }
+        if (typeof eventTypes.ONLINE_STATUS_CHANGED === 'string') {
+            try {
+                eventSource.on(eventTypes.ONLINE_STATUS_CHANGED, noteOnlineStatus);
+            } catch { /* ignore */ }
+        }
+    }
+
+    // 兜底：下拉 change。TauriTavern 上事件系统不一定全发，下拉这一路最实在。
+    const switchySelectors = '#connection_profiles, #main_api, #chat_completion_source, #textgen_type';
+    document.addEventListener('change', (event) => {
+        if (!(event.target instanceof Element)) return;
+        if (!event.target.matches(switchySelectors)) return;
+        armSwitchWindow();
+    }, true);
+
+    try { wrapToastrError(); } catch (error) { warn('toastr wrap failed', error); }
+}
+
+function shouldSuppressSwitchError(message, title) {
+    if (!cfg().enabled || !cfg().suppressSwitchErrors) return false;
+    if (switchArmedAt === 0) return false;
+    const grace = Math.max(0, Number(cfg().switchGraceMs) || 0);
+    if (grace > 0 && performance.now() - switchArmedAt > grace) return false;
+    if (onlineIsConnected) return false;     // 已连上还弹 Unauthorized = 真实问题
+    const text = `${title ?? ''} ${message ?? ''}`;
+    // 两段文案都在才吞 —— 缺一段就放行，避免误伤其它真实 401
+    return /chat completions status/i.test(text) && /Unauthorized/i.test(text);
+}
+
+function wrapToastrError() {
+    const lib = globalThis.toastr;
+    if (!lib || lib.__tppWrapped) return;
+    const original = lib.error;
+    lib.error = function (message, title, opts) {
+        try {
+            if (shouldSuppressSwitchError(message, title)) {
+                dbg('suppressed switch-unauthorized toast:', message, title);
+                return null;
+            }
+        } catch (error) {
+            warn('suppress check failed', error);
+        }
+        return original.call(this, message, title, opts);
+    };
+    lib.error.__tppWrapped = true;
+    if (!globalThis.__tppToastrErrorOrig) globalThis.__tppToastrErrorOrig = original;
+}
+
 /* --------------------------------------------------- 扩展设置面板 */
 
 /* 常用的就这几项，其余全塞进「高级设置」折叠起来 */
@@ -1320,6 +1431,7 @@ const TOGGLES = [
     ['kbdAvoid', '输入法弹出时把弹窗顶上去（带「取消 / 确认」）', 'Lift the popup above the keyboard'],
     ['dragShift', '可以用手指上下拖动弹窗', 'Drag the popup up and down'],
     ['rememberExclude', '记住上次没勾的项（新增配置弹窗）', 'Remember which settings you unchecked'],
+    ['suppressSwitchErrors', '切换连接配置时压住「后端错误 / Unauthorized」误报', 'Suppress the Unauthorized backend error right after switching connection profile'],
 ];
 
 const NUMBERS = [
@@ -1359,6 +1471,7 @@ const NUMBERS_ADV = [
     ['inputHeight', '输入框最小高度 (px)', 'Input height (px)', 24, 96],
     ['kbdMargin', '弹窗底边与输入法的间距 (px)', 'Gap above the keyboard (px)', 0, 80],
     ['animMs', '开窗动画时长 (ms)', 'Animation duration (ms)', 60, 400],
+    ['switchGraceMs', '切换连接配置后压住误报的窗口 (ms)', 'Error-suppression grace window after a switch (ms)', 1000, 20000],
 ];
 
 function buildSettingsUI() {
@@ -1367,13 +1480,15 @@ function buildSettingsUI() {
 
     const block = document.createElement('div');
     block.id = 'tpp_settings';
+    // inline-drawer-content 默认 display:none（折叠），但不同 ST 版本 / 客户端可能改这个默认；
+    // 这里显式把 content 设成折叠态，确保扩展面板在插件列表里默认是收起的，点一下才展开。
     block.innerHTML = `
         <div class="inline-drawer">
             <div class="inline-drawer-toggle inline-drawer-header">
                 <b>${t('title')}</b><small class="tpp-ver">v${VERSION}</small>
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
-            <div class="inline-drawer-content flex-container flexFlowColumn"></div>
+            <div class="inline-drawer-content flex-container flexFlowColumn" style="display:none;"></div>
         </div>`;
     const content = block.querySelector('.inline-drawer-content');
 
@@ -1475,6 +1590,7 @@ function start() {
         watchPopups();
         bindViewport();
         bindKeyGuards();
+        bindSwitchErrorSuppressor();
         ensureEyes();
         buildSettingsUI();
     } catch (error) {
